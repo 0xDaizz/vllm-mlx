@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: Apache-2.0
+"""
+Speculative decoding package for vllm-mlx.
+
+Provides the core abstractions for speculative decoding, where a fast
+proposer (n-gram, EAGLE, or draft model) generates candidate tokens that
+are then verified in parallel by the target model.
+
+Key components:
+- SpecDecodeConfig: Configuration for speculation method and parameters.
+- SpecDecodeMetadata: Per-step draft token data passed between components.
+- BaseProposer / ProposerConfig: Abstract interface for draft token proposers.
+- SpecDecodeStats: Performance tracking and acceptance rate statistics.
+- SpecDecodeRuntime: Orchestrates draft-verify-accept cycles.
+- RequestState / VerifyResult / AcceptResult: Supporting data classes.
+
+Usage:
+    from vllm_mlx.spec_decode import SpecDecodeConfig, BaseProposer
+
+    config = SpecDecodeConfig(method="ngram", num_speculative_tokens=5)
+"""
+
+from .metadata import SpecDecodeConfig, SpecDecodeMetadata
+from .metrics import SpecDecodeStats
+from .proposer import BaseProposer, ProposerConfig
+from .runtime import AcceptResult, RequestState, SpecDecodeRuntime, VerifyResult
+
+__all__ = [
+    # Configuration and metadata
+    "SpecDecodeConfig",
+    "SpecDecodeMetadata",
+    # Proposer abstractions
+    "BaseProposer",
+    "ProposerConfig",
+    # Metrics
+    "SpecDecodeStats",
+    # Runtime
+    "SpecDecodeRuntime",
+    "RequestState",
+    "VerifyResult",
+    "AcceptResult",
+]

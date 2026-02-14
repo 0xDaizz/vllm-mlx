@@ -13,6 +13,7 @@ The design follows vLLM's engine architecture adapted for MLX.
 
 import asyncio
 import logging
+import os
 import time
 import uuid
 from dataclasses import dataclass
@@ -90,6 +91,37 @@ class EngineCore:
             tokenizer=tokenizer,
             config=scheduler_config,
         )
+
+        # Log speculative decoding status
+        if scheduler_config.speculative_method is not None:
+            logger.info(
+                f"Engine {self._engine_id} speculative decoding: "
+                f"method={scheduler_config.speculative_method}, "
+                f"k={scheduler_config.num_speculative_tokens}"
+            )
+
+        # Distributed mode: wire communicator to scheduler if TP is active
+        self._communicator = None
+        if os.environ.get("VLLM_MLX_DISTRIBUTED") == "1":
+            world_size = int(os.environ.get("VLLM_MLX_WORLD_SIZE", "1"))
+            if world_size > 1:
+                from .distributed import get_communicator
+
+                self._communicator = get_communicator()
+                self.scheduler.set_communicator(self._communicator)
+                logger.info(
+                    f"Engine {self._engine_id} distributed mode: "
+                    f"rank={self._communicator.rank}, "
+                    f"world_size={self._communicator.world_size}"
+                )
+
+                # Warn if model may not be TP-sharded (full integration in Phase 5)
+                if not hasattr(model, '_shard_applied'):
+                    logger.warning(
+                        "Distributed mode enabled but model may not be TP-sharded. "
+                        "Ensure model is loaded with sharded_load() for correct TP execution. "
+                        "See distributed_launcher.py for proper distributed server startup."
+                    )
 
         # Output collectors for low-latency streaming (vLLM pattern)
         self._output_collectors: Dict[str, RequestOutputCollector] = {}
@@ -515,7 +547,7 @@ class EngineCore:
         scheduler_stats = self.scheduler.get_stats()
         uptime = time.time() - self._start_time if self._start_time else 0
 
-        return {
+        stats = {
             "running": self._running,
             "uptime_seconds": uptime,
             "steps_executed": self._steps_executed,
@@ -524,6 +556,26 @@ class EngineCore:
             "requests": self.scheduler.get_running_requests_info(),
             **scheduler_stats,
         }
+
+        # Add spec decode stats from scheduler
+        if self.scheduler._spec_decode_runtime is not None:
+            runtime = self.scheduler._spec_decode_runtime
+            stats["spec_decode"] = {
+                "enabled": True,
+                "method": self.scheduler.config.speculative_method,
+                "k": self.scheduler.config.num_speculative_tokens,
+                "total_drafts": runtime.stats.num_drafts,
+                "total_draft_tokens": runtime.stats.num_draft_tokens,
+                "total_accepted": runtime.stats.num_accepted_tokens,
+                "acceptance_rate": runtime.stats.acceptance_rate(),
+            }
+
+        # Add distributed mode info
+        if self._communicator is not None and self._communicator.is_distributed:
+            stats["tp_world_size"] = self._communicator.world_size
+            stats["tp_rank"] = self._communicator.rank
+
+        return stats
 
     def get_cache_stats(self) -> Optional[Dict[str, Any]]:
         """Get prefix cache statistics."""
@@ -545,6 +597,10 @@ class EngineCore:
             self._owns_model = False
             logger.debug(f"Engine {self._engine_id} released model ownership")
 
+    def get_communicator(self):
+        """Return the distributed communicator, or None if not in distributed mode."""
+        return self._communicator
+
     def close(self) -> None:
         """
         Explicitly close the engine and release resources.
@@ -554,6 +610,21 @@ class EngineCore:
         """
         if self._closed:
             return
+
+        # Signal distributed workers to shut down before releasing resources
+        if self._communicator is not None and self._communicator.is_distributed:
+            try:
+                # Send shutdown sentinel FIRST — workers are blocking on
+                # receive_step_plan(), so a barrier() here would deadlock.
+                self._communicator.broadcast_step_plan(None)
+                logger.debug(
+                    f"Engine {self._engine_id} sent shutdown signal to "
+                    f"{self._communicator.world_size - 1} worker(s)"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Engine {self._engine_id} distributed shutdown error: {e}"
+                )
 
         # Release model ownership BEFORE setting _closed
         # (_release_model checks not self._closed)

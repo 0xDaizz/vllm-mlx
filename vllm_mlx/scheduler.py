@@ -25,6 +25,16 @@ from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
 from .paged_cache import PagedCacheManager
 from .prefix_cache import BlockAwarePrefixCache, PrefixCacheManager
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
+from .spec_decode import (
+    SpecDecodeConfig,
+    SpecDecodeRuntime,
+    SpecDecodeStats,
+    AcceptResult,
+    RequestState,
+    VerifyResult,
+)
+from .spec_decode.ngram_proposer import NgramProposer
+from .spec_decode.rejection_sampler import RejectionSampler
 from .utils.mamba_cache import ensure_mamba_support
 
 logger = logging.getLogger(__name__)
@@ -94,6 +104,12 @@ class SchedulerConfig:
     # saved cache is reused for the next request with the same prefix.
     # 0 = disabled. Only effective when chunked_prefill_tokens > 0.
     mid_prefill_save_interval: int = 8192
+
+    # Speculative decoding settings
+    speculative_method: Optional[str] = None  # None = disabled, "ngram" = n-gram proposer
+    num_speculative_tokens: int = 3  # Number of draft tokens per step (k)
+    spec_decode_disable_batch_size: Optional[int] = None  # Disable spec decode above this batch size
+    draft_model_name: Optional[str] = None  # Draft model path (for future model-based proposers)
 
 
 @dataclass
@@ -534,6 +550,12 @@ class Scheduler:
         self.batch_generator: Optional[BatchGenerator] = None
         self._current_sampler_params: Optional[Tuple] = None
 
+        # Distributed TP support (must be initialized before cache config
+        # which references self._tp_world_size)
+        self._communicator = None  # Set externally for distributed mode
+        self._tp_world_size = 1
+        self._pending_distributed_removes: Set[str] = set()  # Finished/aborted IDs to send to workers
+
         # Prefix cache for KV state reuse
         self.prefix_cache: Optional[PrefixCacheManager] = None
         self.memory_aware_cache: Optional[MemoryAwarePrefixCache] = None
@@ -564,6 +586,8 @@ class Scheduler:
                     kv_bits=self.config.kv_cache_quantization_bits,
                     kv_group_size=self.config.kv_cache_quantization_group_size,
                     kv_min_quantize_tokens=self.config.kv_cache_min_quantize_tokens,
+                    tp_world_size=self._tp_world_size,
+                    tp_rank=0,  # Scheduler always runs on rank 0
                 )
                 self.memory_aware_cache = MemoryAwarePrefixCache(
                     model=model,
@@ -597,6 +621,45 @@ class Scheduler:
         self._step_count = 0
         self._clear_cache_interval = 32
         self._memory_log_interval = 256
+
+        # Speculative decoding (initialized lazily on first spec-eligible step)
+        self._spec_decode_runtime: Optional[SpecDecodeRuntime] = None
+        self._spec_decode_enabled = self.config.speculative_method is not None
+        if self._spec_decode_enabled:
+            self._init_spec_decode()
+
+    def set_communicator(self, communicator) -> None:
+        """Attach a distributed communicator for TP mode.
+
+        When set, the scheduler broadcasts StepPlans from rank 0
+        so all ranks maintain synchronized BatchGenerator state.
+        """
+        self._communicator = communicator
+        if communicator is not None and communicator.is_distributed:
+            self._tp_world_size = communicator.world_size
+            logger.info(f"Scheduler TP mode enabled: world_size={self._tp_world_size}")
+
+            # Disable prefix caching in distributed mode to prevent divergence.
+            # Workers don't receive KV cache payloads, so cache hits on rank 0
+            # would cause rank 0 to insert fewer tokens than workers expect.
+            if self.memory_aware_cache is not None:
+                logger.info(
+                    "Disabling memory-aware prefix cache for distributed mode "
+                    "(workers cannot share KV cache state)"
+                )
+                self.memory_aware_cache.clear()
+                self.memory_aware_cache = None
+            if self.prefix_cache is not None:
+                logger.info(
+                    "Disabling prefix cache for distributed mode"
+                )
+                self.prefix_cache.clear()
+                self.prefix_cache = None
+            if self.block_aware_cache is not None:
+                logger.info(
+                    "Disabling block-aware cache for distributed mode"
+                )
+                self.block_aware_cache = None
 
     def _get_actual_tokenizer(self, tokenizer: Any) -> Any:
         """
@@ -639,6 +702,367 @@ class Scheduler:
                     # Handle case where eos_token_ids is a single int
                     stop_tokens.add(tok.eos_token_ids)
         return stop_tokens
+
+    # -----------------------------------------------------------------
+    # Speculative decoding
+    # -----------------------------------------------------------------
+
+    def _init_spec_decode(self) -> None:
+        """Initialize speculative decoding components."""
+        spec_config = SpecDecodeConfig(
+            method=self.config.speculative_method,
+            num_speculative_tokens=self.config.num_speculative_tokens,
+            disable_by_batch_size=self.config.spec_decode_disable_batch_size,
+        )
+
+        # Create proposer based on method
+        if self.config.speculative_method == "ngram":
+            from .spec_decode.ngram_proposer import NgramProposer, NgramProposerConfig
+
+            proposer_config = NgramProposerConfig(
+                num_speculative_tokens=self.config.num_speculative_tokens,
+            )
+            proposer = NgramProposer(proposer_config)
+        else:
+            raise ValueError(
+                f"Unknown speculative method: {self.config.speculative_method}"
+            )
+
+        # Create rejection sampler (greedy for now, stochastic needs draft model logits)
+        sampler = RejectionSampler(method="greedy")
+
+        self._spec_decode_runtime = SpecDecodeRuntime(
+            model=self.model,
+            proposer=proposer,
+            rejection_sampler=sampler,
+            config=spec_config,
+        )
+        logger.info(
+            f"Speculative decoding enabled: method={self.config.speculative_method}, "
+            f"k={self.config.num_speculative_tokens}"
+        )
+
+    def _can_spec_decode(self) -> bool:
+        """Check if speculative decoding can run this step.
+
+        Returns False when:
+        - Spec decode is not enabled
+        - No active batch exists
+        - There are waiting requests (prefill needed -- don't mix with speculation)
+        - Batch size exceeds threshold
+        - Model is not transformer-only (Mamba/hybrid not supported)
+        """
+        if not self._spec_decode_enabled or self._spec_decode_runtime is None:
+            return False
+        if self.batch_generator is None:
+            return False
+        if self.batch_generator.active_batch is None:
+            return False
+        # Disable spec decode under TP — workers run batch_generator.next()
+        # which expects 1-token input, not the (B, k+1) verify tensor.
+        # TP + spec decode integration is Phase 5 work.
+        if self._communicator is not None and self._communicator.is_distributed:
+            return False
+        if self.waiting:  # Pending prefills -- run normal step
+            return False
+        # Don't spec decode if there are unprocessed prompts waiting for prefill
+        if hasattr(self.batch_generator, 'unprocessed_prompts') and self.batch_generator.unprocessed_prompts:
+            return False
+        # Check batch size threshold
+        batch_size = len(self.running)
+        if self._spec_decode_runtime.should_disable(batch_size):
+            return False
+        # Check for transformer-only model (Mamba/hybrid not supported for spec decode)
+        if hasattr(self.model, "args") and hasattr(self.model.args, "model_type"):
+            model_type = self.model.args.model_type
+            if model_type in ("mamba", "jamba", "nemotron"):
+                return False
+        return True
+
+    def _step_spec_decode(self) -> Optional[list]:
+        """Execute one speculative decoding step.
+
+        Flow:
+        1. Build request states from running requests
+        2. Propose k draft tokens per request via NgramProposer
+        3. Build input tensor: [y, d1, ..., dk] per request
+        4. Run target model forward: logits = model(input_tokens, cache)
+        5. Build VerifyResult with per-request sliced logits
+        6. Run rejection sampling via runtime.accept_and_commit()
+        7. Build Response objects for each committed token
+        8. Rollback KV cache for rejected draft positions
+        9. Update batch state for next step
+
+        Returns:
+            List of Response-like objects, or None if no drafts were
+            generated (caller should fall back to the normal path).
+        """
+        batch = self.batch_generator.active_batch
+        runtime = self._spec_decode_runtime
+        k = runtime.config.num_speculative_tokens
+
+        # 1. Build request states
+        request_states = {}
+        uid_to_request_id_local = {}
+        for i, uid in enumerate(batch.uids):
+            request_id = self.uid_to_request_id.get(uid)
+            if request_id is None:
+                continue
+            request = self.running.get(request_id)
+            if request is None:
+                continue
+            # Token sequence = prompt + output tokens generated so far
+            token_ids = list(request.prompt_token_ids or []) + list(
+                request.output_token_ids
+            )
+            request_states[request_id] = RequestState(
+                request_id=request_id,
+                token_ids=token_ids,
+                batch_uid=uid,
+            )
+            uid_to_request_id_local[uid] = request_id
+
+        if not request_states:
+            return []
+
+        # 2. Propose drafts
+        draft_metadata = runtime.propose_drafts(request_states)
+
+        # 3. Build input tensor for verification
+        # For each request: [y_i, draft_1, ..., draft_k] (padded to max_k+1)
+        # batch.y contains the last sampled token (not yet fed to model)
+        batch_y = batch.y.tolist()  # (B,)
+
+        # Map request order to batch indices
+        batch_request_ids = []
+        batch_indices = []
+        for i, uid in enumerate(batch.uids):
+            rid = uid_to_request_id_local.get(uid)
+            if rid and rid in request_states:
+                batch_request_ids.append(rid)
+                batch_indices.append(i)
+
+        if not batch_request_ids:
+            return []
+
+        # Build padded input tokens: shape (len(batch_request_ids), max_k + 1)
+        max_draft_len = 0
+        draft_per_request = {}
+        for rid in batch_request_ids:
+            drafts = draft_metadata.get_draft_tokens(rid)
+            draft_per_request[rid] = drafts
+            max_draft_len = max(max_draft_len, len(drafts))
+
+        if max_draft_len == 0:
+            # No drafts generated -- fall back to normal step
+            return None  # Signal caller to use normal path
+
+        input_rows = []
+        draft_lengths = []
+        for rid, batch_idx in zip(batch_request_ids, batch_indices):
+            y_token = batch_y[batch_idx]
+            drafts = draft_per_request[rid]
+            # Pad drafts to max_draft_len with 0 (causal mask makes padding harmless)
+            padded_drafts = list(drafts) + [0] * (max_draft_len - len(drafts))
+            row = [y_token] + padded_drafts  # length = max_draft_len + 1
+            input_rows.append(row)
+            draft_lengths.append(len(drafts))
+
+        input_tokens = mx.array(input_rows, dtype=mx.int32)  # (B_spec, max_k+1)
+
+        # 4. Run target model forward pass
+        # Feed the full [y, d1, ..., dk] sequence through the model with
+        # the existing KV cache. The model returns logits for each position.
+        logits = self.model(input_tokens, cache=batch.cache)
+        # logits shape: (B_spec, max_k+1, vocab_size)
+
+        mx.eval(logits)
+
+        # 5. Build VerifyResult
+        verify_result = VerifyResult()
+        verify_result.request_ids = list(batch_request_ids)
+
+        for i, rid in enumerate(batch_request_ids):
+            num_drafts = draft_lengths[i]
+            # Slice logits for this request: positions 0..num_drafts (inclusive)
+            # Position j verifies draft token j (0-indexed)
+            # Position num_drafts is the bonus position
+            req_logits = logits[i, : num_drafts + 1, :]  # (num_drafts+1, vocab)
+            verify_result.target_logits[rid] = req_logits
+
+        # 6. Run rejection sampling
+        accept_results = runtime.accept_and_commit(verify_result, draft_metadata)
+
+        # 7. Build Response objects and apply stop/max-token checks
+        responses = []
+        stop_tokens = self._get_stop_tokens()
+
+        rollback_counts = {}
+
+        for i, rid in enumerate(batch_request_ids):
+            batch_idx = batch_indices[i]
+            uid = batch.uids[batch_idx]
+            result = accept_results.get(rid)
+            if result is None:
+                continue
+
+            request = self.running.get(rid)
+            if request is None:
+                continue
+
+            tokens_remaining = (
+                request.sampling_params.max_tokens - request.num_output_tokens
+            )
+
+            # Emit one Response per committed token (with stop/max-token clipping)
+            for t_idx, token in enumerate(result.accepted_tokens):
+                if tokens_remaining <= 0:
+                    # Truncate: don't emit more tokens
+                    # Adjust rollback count for unemitted tokens
+                    unemitted = len(result.accepted_tokens) - t_idx
+                    rollback_counts[rid] = rollback_counts.get(rid, 0) + unemitted
+                    break
+
+                # Check stop token
+                finish_reason = None
+                if token in stop_tokens:
+                    finish_reason = "stop"
+                elif tokens_remaining == 1:
+                    finish_reason = "length"
+
+                # Create a Response-like object
+                resp = type(
+                    "Response",
+                    (),
+                    {
+                        "uid": uid,
+                        "token": token,
+                        "finish_reason": finish_reason,
+                        "prompt_cache": None,
+                    },
+                )()
+
+                responses.append(resp)
+                tokens_remaining -= 1
+
+                if finish_reason is not None:
+                    # Stop emitting tokens for this request
+                    unemitted = len(result.accepted_tokens) - t_idx - 1
+                    if unemitted > 0:
+                        rollback_counts[rid] = (
+                            rollback_counts.get(rid, 0) + unemitted
+                        )
+                    break
+
+            # Add original rollback count from rejection
+            rollback_counts[rid] = (
+                rollback_counts.get(rid, 0) + result.rollback_count
+            )
+
+        # 8. Rollback KV cache for rejected positions
+        # trim_per_sequence expects an mx.array of per-sequence trim amounts
+        trim_amounts = []
+        for batch_idx in range(len(batch.uids)):
+            uid = batch.uids[batch_idx]
+            rid = uid_to_request_id_local.get(uid)
+            if rid and rid in rollback_counts:
+                # Also account for padding: max_draft_len - actual_draft_len
+                actual_drafts = (
+                    draft_lengths[batch_request_ids.index(rid)]
+                    if rid in batch_request_ids
+                    else 0
+                )
+                padding_trim = max_draft_len - actual_drafts
+                total_trim = rollback_counts[rid] + padding_trim
+                trim_amounts.append(total_trim)
+            else:
+                # Requests not in spec decode path: trim the padding only
+                trim_amounts.append(max_draft_len)
+
+        if any(t > 0 for t in trim_amounts):
+            trim_array = mx.array(trim_amounts, dtype=mx.int32)
+            batch.cache.trim_per_sequence(trim_array)
+
+        # 9. Update batch state for next step
+        # After spec decode, we need batch.y and batch.logprobs set correctly
+        # for the NEXT normal step. batch.y = the last committed token for
+        # each request. batch.logprobs = logits at the correction/bonus
+        # position, normalized.
+
+        new_y = []
+        new_logprobs = []
+        for batch_idx in range(len(batch.uids)):
+            uid = batch.uids[batch_idx]
+            rid = uid_to_request_id_local.get(uid)
+            if rid and rid in accept_results:
+                result = accept_results[rid]
+                i = batch_request_ids.index(rid)
+
+                if result.accepted_tokens:
+                    # Last committed token becomes new y
+                    new_y.append(result.accepted_tokens[-1])
+                    # Logprobs at the position after last accepted token
+                    # This is the correction/bonus position
+                    correction_pos = result.num_accepted  # 0-indexed position
+                    req_logits = verify_result.target_logits[rid]
+                    if correction_pos < req_logits.shape[0]:
+                        log_probs = mx.softmax(req_logits[correction_pos], axis=-1)
+                        log_probs = mx.log(log_probs + 1e-12)
+                        new_logprobs.append(log_probs)
+                    else:
+                        # Fallback: use last position
+                        log_probs = mx.softmax(req_logits[-1], axis=-1)
+                        log_probs = mx.log(log_probs + 1e-12)
+                        new_logprobs.append(log_probs)
+                else:
+                    # No tokens accepted -- keep original y
+                    new_y.append(batch_y[batch_idx])
+                    new_logprobs.append(
+                        batch.logprobs[batch_idx]
+                        if batch.logprobs
+                        else mx.zeros((1,))
+                    )
+            else:
+                new_y.append(batch_y[batch_idx])
+                new_logprobs.append(
+                    batch.logprobs[batch_idx]
+                    if batch.logprobs
+                    else mx.zeros((1,))
+                )
+
+        batch.y = mx.array(new_y, dtype=mx.int32)
+        batch.logprobs = new_logprobs
+
+        # Update num_tokens and tokens list for each request.
+        # Invariant: batch.tokens contains all tokens whose KV state is in
+        # the cache.  batch.y holds the next unprocessed token (like the
+        # normal generation path).  After trim, the cache has:
+        #   original + y + d1 + ... + d_{num_accepted}
+        # So we append y + accepted_drafts (NOT the bonus/correction) to
+        # tokens, and set batch.y = bonus (already done above).
+        for rid in accept_results:
+            result = accept_results[rid]
+            if rid in batch_request_ids:
+                i = batch_request_ids.index(rid)
+                batch_idx = batch_indices[i]
+                # Append y (the previous batch.y that was just processed)
+                batch.tokens[batch_idx] = mx.concatenate(
+                    (batch.tokens[batch_idx], mx.array([batch_y[batch_idx]]))
+                )
+                # Append accepted drafts (all committed tokens EXCEPT the
+                # last one which is the bonus/correction = new batch.y)
+                tokens_for_cache = result.accepted_tokens[:-1] if result.accepted_tokens else []
+                for token in tokens_for_cache:
+                    batch.tokens[batch_idx] = mx.concatenate(
+                        (batch.tokens[batch_idx], mx.array([token]))
+                    )
+                # num_tokens tracks output tokens (all committed including bonus)
+                n_committed = len(result.accepted_tokens)
+                batch.num_tokens[batch_idx] += n_committed
+
+        mx.eval(batch.y)
+
+        return responses
 
     def _create_batch_generator(
         self, sampling_params: SamplingParams
@@ -1218,6 +1642,9 @@ class Scheduler:
             request.set_finished(RequestStatus.FINISHED_ABORTED)
         self.finished_req_ids.add(request_id)
 
+        if self._communicator is not None and self._communicator.is_distributed:
+            self._pending_distributed_removes.add(request_id)
+
         # Flush Metal encoders after removing arrays from batch
         mx.clear_cache()
 
@@ -1448,6 +1875,9 @@ class Scheduler:
 
     def _cleanup_finished(self, finished_ids: Set[str]) -> None:
         """Clean up finished requests and store caches for reuse."""
+        if self._communicator is not None and self._communicator.is_distributed:
+            self._pending_distributed_removes.update(finished_ids)
+
         for request_id in finished_ids:
             request = self.running.get(request_id)
 
@@ -1586,6 +2016,15 @@ class Scheduler:
                     del self.uid_to_request_id[uid]
                 del self.request_id_to_uid[request_id]
 
+                # Remove from batch generator (needed for spec decode path which
+                # bypasses BatchGenerator.next() internal removal)
+                if self.batch_generator is not None:
+                    self.batch_generator.remove([uid])
+
+            # Clean up spec decode state
+            if self._spec_decode_runtime is not None:
+                self._spec_decode_runtime.remove_request(request_id)
+
             # Track as finished
             self.finished_req_ids.add(request_id)
 
@@ -1636,6 +2075,92 @@ class Scheduler:
         if count > 0:
             logger.info(f"Rescheduled {count} requests for retry")
 
+    def _broadcast_sampled_tokens(self, responses) -> None:
+        """Broadcast sampled token IDs from rank 0 to all ranks.
+
+        After batch_generator.next(), rank 0 has the authoritative
+        sampled tokens. Broadcast them so all ranks can advance
+        their KV caches consistently.
+
+        Args:
+            responses: List of BatchGenerator.Response objects from next()
+        """
+        if self._communicator is None or not self._communicator.is_distributed:
+            return
+
+        if not responses:
+            return
+
+        # Extract token IDs from responses (rank 0 has the real ones)
+        token_ids = mx.array([r.token for r in responses], dtype=mx.int32)
+
+        # Broadcast from rank 0 to all
+        token_ids = self._communicator.broadcast_tokens(token_ids, src=0)
+        mx.eval(token_ids)
+
+        # Update responses with the broadcast tokens on non-rank-0 workers
+        token_list = token_ids.tolist()
+        for i, response in enumerate(responses):
+            response.token = token_list[i]
+
+    def _build_step_plan(self, scheduled: list, finished_ids: set, token_ids: dict | None = None) -> "StepPlan":
+        """Build a StepPlan from the current scheduling state.
+
+        Args:
+            scheduled: List of newly scheduled Request objects
+            finished_ids: Set of finished request IDs (to remove)
+            token_ids: Dict of request_id -> sampled token (from batch_generator.next())
+
+        Returns:
+            StepPlan for broadcast to all ranks
+        """
+        from vllm_mlx.distributed import InsertOp, StepPlan
+        import hashlib
+
+        inserts = []
+        for req in scheduled:
+            # Determine tokens to process (same logic as _schedule_waiting)
+            if req.remaining_tokens is not None and len(req.remaining_tokens) == 0:
+                tokens = req.prompt_token_ids[-1:]
+            elif req.remaining_tokens:
+                tokens = req.remaining_tokens
+            else:
+                tokens = req.prompt_token_ids
+
+            inserts.append(InsertOp(
+                request_id=req.request_id,
+                tokens=tokens,
+                max_tokens=req.sampling_params.max_tokens,
+                cache_info={
+                    "cached_tokens": req.cached_tokens or 0,
+                    "has_cache": req.prompt_cache is not None,
+                },
+            ))
+
+        removes = list(finished_ids) if finished_ids else []
+
+        # Pending aborts also need to be removed on all ranks
+        abort_ids = list(self._pending_abort_ids)
+        removes.extend(abort_ids)
+
+        # Build fingerprint from current running request IDs for sync verification
+        running_ids = sorted(self.running.keys())
+        fp_data = ",".join(running_ids) + f"|step={self._step_count}"
+        fingerprint = hashlib.md5(fp_data.encode()).hexdigest()[:16]
+
+        # Sampling seeds (for deterministic sampling across ranks)
+        seeds = {}
+        for req_id in self.running:
+            seeds[req_id] = hash(req_id + str(self._step_count)) & 0xFFFFFFFF
+
+        return StepPlan(
+            step_id=self._step_count,
+            inserts=inserts,
+            removes=removes,
+            sampling_seeds=seeds,
+            fingerprint=fingerprint,
+        )
+
     def step(self, max_retries: int = 1) -> SchedulerOutput:
         """
         Execute one scheduling step with automatic error recovery.
@@ -1666,16 +2191,56 @@ class Scheduler:
                     r.num_prompt_tokens for r in scheduled
                 )
 
+                # TP: Broadcast StepPlan BEFORE batch_generator.next()
+                # Workers need inserts/removes before running the forward pass
+                if self._communicator is not None and self._communicator.is_distributed:
+                    plan = self._build_step_plan(scheduled, self._pending_distributed_removes)
+                    self._communicator.broadcast_step_plan(plan)
+                    self._pending_distributed_removes.clear()  # Clear after broadcast
+
                 # Run generation step if we have running requests
                 if self.batch_generator is not None and self.running:
-                    responses = self.batch_generator.next()
-                    output.has_work = True
+                    # Try speculative decoding path
+                    if self._can_spec_decode():
+                        spec_responses = self._step_spec_decode()
+                        if spec_responses is not None:
+                            responses = spec_responses
+                            output.has_work = True
+                            # TP: Broadcast spec decode tokens
+                            self._broadcast_sampled_tokens(responses)
+                            if responses:
+                                outputs, finished_ids = (
+                                    self._process_batch_responses(responses)
+                                )
+                                output.outputs = outputs
+                                output.finished_request_ids = finished_ids
+                                self._cleanup_finished(finished_ids)
+                        else:
+                            # Spec decode returned None (no drafts) -- fall back
+                            responses = self.batch_generator.next()
+                            output.has_work = True
+                            self._broadcast_sampled_tokens(responses)
+                            if responses:
+                                outputs, finished_ids = (
+                                    self._process_batch_responses(responses)
+                                )
+                                output.outputs = outputs
+                                output.finished_request_ids = finished_ids
+                                self._cleanup_finished(finished_ids)
+                    else:
+                        responses = self.batch_generator.next()
+                        output.has_work = True
 
-                    if responses:
-                        outputs, finished_ids = self._process_batch_responses(responses)
-                        output.outputs = outputs
-                        output.finished_request_ids = finished_ids
-                        self._cleanup_finished(finished_ids)
+                        # TP: Broadcast sampled tokens from rank 0 to all ranks
+                        self._broadcast_sampled_tokens(responses)
+
+                        if responses:
+                            outputs, finished_ids = (
+                                self._process_batch_responses(responses)
+                            )
+                            output.outputs = outputs
+                            output.finished_request_ids = finished_ids
+                            self._cleanup_finished(finished_ids)
 
                 # Success - break out of retry loop
                 break
@@ -1832,6 +2397,19 @@ class Scheduler:
             stats["memory_aware_cache"] = self.memory_aware_cache.get_stats()
         elif self.prefix_cache is not None:
             stats["prefix_cache"] = self.prefix_cache.get_stats()
+
+        # Add spec decode stats
+        if self._spec_decode_runtime is not None:
+            stats["spec_decode"] = {
+                "enabled": self._spec_decode_enabled,
+                "method": self.config.speculative_method,
+                "num_speculative_tokens": self.config.num_speculative_tokens,
+                "total_drafts": self._spec_decode_runtime.stats.num_drafts,
+                "total_draft_tokens": self._spec_decode_runtime.stats.num_draft_tokens,
+                "total_accepted": self._spec_decode_runtime.stats.num_accepted_tokens,
+                "acceptance_rate": self._spec_decode_runtime.stats.acceptance_rate(),
+            }
+
         return stats
 
     def get_cache_stats(self) -> Optional[Dict[str, Any]]:
@@ -1879,6 +2457,8 @@ class Scheduler:
         """
         # Standard reset first
         self.reset()
+
+        self._pending_distributed_removes.clear()
 
         # Clear any model-level cache state
         # MLX models may have internal cache references

@@ -2221,6 +2221,27 @@ Examples:
         help="Default top_p for generation when not specified in request",
     )
 
+    # Speculative decoding options
+    parser.add_argument(
+        "--speculative-method",
+        type=str,
+        default=None,
+        choices=["ngram"],
+        help="Enable speculative decoding with the specified method (e.g., 'ngram')",
+    )
+    parser.add_argument(
+        "--num-speculative-tokens",
+        type=int,
+        default=3,
+        help="Number of draft tokens per speculative decoding step (default: 3)",
+    )
+    parser.add_argument(
+        "--spec-decode-disable-batch-size",
+        type=int,
+        default=None,
+        help="Disable speculative decoding when batch size exceeds this threshold",
+    )
+
     args = parser.parse_args()
 
     # Set global configuration
@@ -2271,12 +2292,24 @@ Examples:
     # Pre-load embedding model if specified
     load_embedding_model(args.embedding_model, lock=True)
 
+    # Build scheduler config with spec decode settings
+    scheduler_config = None
+    if args.continuous_batching:
+        from vllm_mlx.scheduler import SchedulerConfig
+
+        scheduler_config = SchedulerConfig(
+            speculative_method=args.speculative_method,
+            num_speculative_tokens=args.num_speculative_tokens,
+            spec_decode_disable_batch_size=args.spec_decode_disable_batch_size,
+        )
+
     # Load model before starting server
     load_model(
         args.model,
         use_batching=args.continuous_batching,
         max_tokens=args.max_tokens,
         force_mllm=args.mllm,
+        scheduler_config=scheduler_config,
     )
 
     # Start server
