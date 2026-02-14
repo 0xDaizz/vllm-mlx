@@ -69,6 +69,9 @@ class MLXWorker:
         self.tokenizer = None
         self.model_runner = None
 
+        # Distributed communicator (initialized in init_device if needed)
+        self._communicator = None
+
         # Device info
         self.device = torch.device("cpu")  # MLX uses its own device management
 
@@ -91,6 +94,17 @@ class MLXWorker:
                 f"MLX Device: {info['chip_name']} with {info['memory_gb']:.1f}GB"
             )
 
+            # Initialize distributed group if in distributed mode
+            self._communicator = None
+            if self._is_distributed_mode():
+                from vllm_mlx.distributed import get_communicator
+
+                self._communicator = get_communicator()
+                logger.info(
+                    f"Distributed mode: rank={self._communicator.rank}, "
+                    f"world_size={self._communicator.world_size}"
+                )
+
             # Initialize model runner
             from vllm_mlx.model_runner import MLXModelRunner
 
@@ -102,11 +116,36 @@ class MLXWorker:
                 "Install with: pip install mlx mlx-lm"
             )
 
+    def _is_distributed_mode(self) -> bool:
+        """Check if we're running in distributed mode.
+
+        Distributed mode is detected by:
+        1. MLX_RANK environment variable being set, OR
+        2. VLLM_MLX_DISTRIBUTED environment variable being set, OR
+        3. parallel_config.world_size > 1
+        """
+        import os
+
+        if os.environ.get("MLX_RANK") is not None:
+            return True
+        if os.environ.get("VLLM_MLX_DISTRIBUTED") == "1":
+            return True
+        if hasattr(self.parallel_config, "world_size") and self.parallel_config.world_size > 1:
+            return True
+        return False
+
+    @property
+    def communicator(self):
+        """Get the distributed communicator, or None if single-node."""
+        return self._communicator
+
     def load_model(self) -> None:
         """Load model using mlx-lm."""
         if self.model_runner is None:
             raise RuntimeError("init_device() must be called before load_model()")
 
+        # Attach communicator for distributed model loading (Phase 1)
+        self.model_runner._communicator = self._communicator
         self.model_runner.load_model()
         logger.info(f"Model loaded: {self.model_config.model}")
 
@@ -202,6 +241,14 @@ class MLXWorker:
     def shutdown(self) -> None:
         """Clean up resources."""
         logger.info("Shutting down MLX Worker")
+
+        # Clean up communicator
+        if self._communicator is not None:
+            try:
+                self._communicator.barrier()
+            except Exception:
+                logger.warning("Barrier during shutdown failed, continuing cleanup")
+            self._communicator = None
 
         # Clear model
         self.model = None

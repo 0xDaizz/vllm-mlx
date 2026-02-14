@@ -104,24 +104,31 @@ class MLXModelRunner:
         )
 
     def load_model(self) -> None:
-        """Load model using mlx-lm with optimizations."""
+        """Load model using mlx-lm with optimizations.
+
+        If a distributed communicator is attached (via _communicator),
+        uses mlx_lm's sharded_load() for tensor parallelism. Otherwise,
+        loads normally with mlx_lm.load().
+        """
         if self._loaded:
             return
 
+        # Check if we're in distributed mode
+        communicator = getattr(self, '_communicator', None)
+        is_distributed = (
+            communicator is not None
+            and hasattr(communicator, 'is_distributed')
+            and communicator.is_distributed
+        )
+
         try:
-            from mlx_lm import load
-
             model_name = self.model_config.model
-
-            logger.info(f"Loading model with mlx-lm: {model_name}")
             start_time = time.time()
 
-            self.model, self.tokenizer = load(
-                model_name,
-                tokenizer_config={
-                    "trust_remote_code": self.model_config.trust_remote_code,
-                },
-            )
+            if is_distributed:
+                self._load_model_distributed(model_name, communicator)
+            else:
+                self._load_model_single(model_name)
 
             load_time = time.time() - start_time
             logger.info(f"Model loaded in {load_time:.2f}s")
@@ -143,6 +150,57 @@ class MLXModelRunner:
         except Exception as e:
             logger.error(f"Failed to load model: {e}")
             raise
+
+    def _load_model_single(self, model_name: str) -> None:
+        """Load model on a single device using mlx_lm.load()."""
+        from mlx_lm import load
+
+        logger.info(f"Loading model with mlx-lm: {model_name}")
+
+        self.model, self.tokenizer = load(
+            model_name,
+            tokenizer_config={
+                "trust_remote_code": self.model_config.trust_remote_code,
+            },
+        )
+
+    def _load_model_distributed(self, model_name: str, communicator) -> None:
+        """Load model with tensor parallelism using sharded_load.
+
+        Uses mlx-lm's sharded_load() which:
+        1. Downloads model weights (all ranks)
+        2. Loads model lazily
+        3. Applies model.shard(group) for tensor parallelism
+        4. Evaluates parameters layer-by-layer (memory efficient)
+        5. Synchronizes all ranks
+
+        Args:
+            model_name: HuggingFace model name or local path
+            communicator: MLXCommunicator with the distributed group
+        """
+        from mlx_lm.utils import sharded_load
+
+        group = communicator.group
+        rank = communicator.rank
+        world_size = communicator.world_size
+
+        logger.info(
+            f"Loading model with tensor parallelism: {model_name} "
+            f"(rank={rank}, world_size={world_size})"
+        )
+
+        self.model, self.tokenizer = sharded_load(
+            model_name,
+            pipeline_group=None,
+            tensor_group=group,
+        )
+
+        # Synchronize all ranks after loading
+        communicator.barrier()
+
+        logger.info(
+            f"Sharded model loaded (rank={rank}/{world_size}): {model_name}"
+        )
 
     def _apply_optimizations(self) -> None:
         """Apply low-level optimizations for maximum performance."""

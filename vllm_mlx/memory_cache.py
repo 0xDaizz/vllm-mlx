@@ -25,8 +25,10 @@ Example:
 from __future__ import annotations
 
 import bisect
+import json
 import logging
 import math
+import os
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
@@ -92,6 +94,11 @@ def estimate_kv_cache_memory(cache: list[Any]) -> int:
     total memory footprint using shape+dtype metadata to avoid triggering
     lazy evaluation (which would cause a VRAM spike).
 
+    Note on TP (Tensor Parallelism): When the model is TP-sharded, the
+    cache already stores the actual tensors from this rank's model, which
+    are already head-sharded (1/N of total heads). So this function is
+    already correct for per-rank memory estimation — no TP adjustment needed.
+
     Args:
         cache: List of layer cache objects, each containing keys/values tensors.
 
@@ -155,6 +162,8 @@ class MemoryCacheConfig:
         kv_bits: Number of bits for KV cache quantization.
         kv_group_size: Group size for KV cache quantization.
         kv_min_quantize_tokens: Minimum sequence length for quantization to apply.
+        tp_world_size: Number of TP (Tensor Parallelism) ranks.
+        tp_rank: This rank's index in the TP group.
     """
 
     max_memory_mb: int | None = None
@@ -165,6 +174,9 @@ class MemoryCacheConfig:
     kv_bits: int = 8
     kv_group_size: int = 64
     kv_min_quantize_tokens: int = 256
+    # TP (Tensor Parallelism) configuration
+    tp_world_size: int = 1  # Number of TP ranks
+    tp_rank: int = 0  # This rank's index
 
     def __post_init__(self) -> None:
         if not 0.0 < self.max_memory_percent <= 1.0:
@@ -421,6 +433,10 @@ class MemoryAwarePrefixCache:
         self._model_id = id(model)
         self._config = config or MemoryCacheConfig()
 
+        # TP (Tensor Parallelism) configuration
+        self._tp_world_size = self._config.tp_world_size
+        self._tp_rank = self._config.tp_rank
+
         # OrderedDict maintains insertion order for LRU
         # Key: tuple(tokens), Value: _CacheEntry
         self._entries: OrderedDict[tuple[int, ...], _CacheEntry] = OrderedDict()
@@ -440,11 +456,27 @@ class MemoryAwarePrefixCache:
         # Track the match type from the last fetch() call
         self._last_match_type: str | None = None
 
+        tp_info = ""
+        if self._tp_world_size > 1:
+            tp_info = f", tp={self._tp_world_size}x (rank {self._tp_rank})"
         logger.info(
             f"MemoryAwarePrefixCache initialized: "
             f"max_memory={self._max_memory / _BYTES_PER_MB:.1f}MB, "
-            f"max_entries={self._config.max_entries}"
+            f"max_entries={self._config.max_entries}{tp_info}"
         )
+
+    def _make_cache_key(self, tokens: tuple[int, ...]) -> tuple:
+        """Create a TP-aware cache key.
+
+        When tp_world_size > 1, the cache key includes the world size
+        to prevent cache collisions between different TP configurations.
+        This is important when:
+        - Switching between different TP sizes (e.g., 1 -> 2)
+        - Loading cache from disk with different TP config
+        """
+        if self._tp_world_size > 1:
+            return (tokens, self._tp_world_size)
+        return tokens  # Backwards compatible for single-device
 
     def fetch(self, tokens: list[int]) -> tuple[list[Any] | None, list[int]]:
         """
@@ -854,18 +886,23 @@ class MemoryAwarePrefixCache:
     def save_to_disk(self, cache_dir: str) -> bool:
         """Save all cache entries to disk using mlx_lm's safetensors format.
 
-        Directory layout::
+        In TP mode, saves to a rank-specific subdirectory::
+
+            cache_dir/tp{N}/rank{R}/
+              index.json          # token keys + metadata per entry
+              tp_metadata.json    # TP configuration metadata
+              entry_0.safetensors # KV arrays for entry 0
+              ...
+
+        In single-device mode, saves directly to cache_dir::
 
             cache_dir/
-              index.json          # token keys + metadata per entry
-              entry_0.safetensors # KV arrays for entry 0
-              entry_1.safetensors
+              index.json
+              entry_0.safetensors
               ...
 
         Returns True if at least one entry was saved.
         """
-        import json
-        import os
         import time as _time
 
         if not self._entries:
@@ -873,7 +910,16 @@ class MemoryAwarePrefixCache:
             return False
 
         t0 = _time.monotonic()
-        os.makedirs(cache_dir, exist_ok=True)
+
+        # Determine save path based on TP configuration
+        if self._tp_world_size > 1:
+            save_dir = os.path.join(
+                cache_dir, f"tp{self._tp_world_size}", f"rank{self._tp_rank}"
+            )
+        else:
+            save_dir = cache_dir
+
+        os.makedirs(save_dir, exist_ok=True)
 
         try:
             from mlx_lm.models.cache import save_prompt_cache
@@ -890,7 +936,7 @@ class MemoryAwarePrefixCache:
 
         saved = 0
         for i, (tokens_key, entry) in enumerate(self._entries.items()):
-            entry_path = os.path.join(cache_dir, f"entry_{i}.safetensors")
+            entry_path = os.path.join(save_dir, f"entry_{i}.safetensors")
             try:
                 save_prompt_cache(
                     entry_path,
@@ -898,7 +944,7 @@ class MemoryAwarePrefixCache:
                     metadata={"num_tokens": str(len(tokens_key))},
                 )
                 # Save tokens separately (can be 100K+ ints → binary is smaller)
-                tokens_path = os.path.join(cache_dir, f"entry_{i}_tokens.bin")
+                tokens_path = os.path.join(save_dir, f"entry_{i}_tokens.bin")
                 import array as _array
 
                 arr = _array.array("i", tokens_key)  # 32-bit signed ints
@@ -922,14 +968,24 @@ class MemoryAwarePrefixCache:
             except Exception as e:
                 logger.warning(f"[cache_persist] failed to save entry {i}: {e}")
 
-        index_path = os.path.join(cache_dir, "index.json")
+        index_path = os.path.join(save_dir, "index.json")
         with open(index_path, "w") as f:
             json.dump(index, f, indent=2)
+
+        # Save TP metadata for validation on load
+        if self._tp_world_size > 1:
+            metadata = {
+                "tp_world_size": self._tp_world_size,
+                "tp_rank": self._tp_rank,
+            }
+            metadata_path = os.path.join(save_dir, "tp_metadata.json")
+            with open(metadata_path, "w") as f:
+                json.dump(metadata, f)
 
         dt = _time.monotonic() - t0
         logger.info(
             f"[cache_persist] SAVED {saved}/{len(self._entries)} entries "
-            f"to {cache_dir} in {dt:.1f}s "
+            f"to {save_dir} in {dt:.1f}s "
             f"({self._current_memory / _BYTES_PER_MB:.0f}MB total)"
         )
         return saved > 0
@@ -937,16 +993,40 @@ class MemoryAwarePrefixCache:
     def load_from_disk(self, cache_dir: str) -> int:
         """Load cache entries from disk.
 
+        In TP mode:
+        - Loads from rank-specific subdirectory
+        - Validates TP metadata matches current config
+        - Invalidates cache if tp_world_size changed
+
         Returns the number of entries successfully loaded.
         """
-        import json
-        import os
         import time as _time
 
-        index_path = os.path.join(cache_dir, "index.json")
+        # Determine load path based on TP configuration
+        if self._tp_world_size > 1:
+            load_dir = os.path.join(
+                cache_dir, f"tp{self._tp_world_size}", f"rank{self._tp_rank}"
+            )
+        else:
+            load_dir = cache_dir
+
+        index_path = os.path.join(load_dir, "index.json")
         if not os.path.exists(index_path):
             logger.info(f"[cache_persist] no index at {index_path}, nothing to load")
             return 0
+
+        # Check if TP metadata matches current configuration
+        metadata_path = os.path.join(load_dir, "tp_metadata.json")
+        if os.path.exists(metadata_path):
+            with open(metadata_path) as f:
+                metadata = json.load(f)
+            if metadata.get("tp_world_size") != self._tp_world_size:
+                logger.warning(
+                    f"Cache TP world_size mismatch: "
+                    f"cached={metadata.get('tp_world_size')}, "
+                    f"current={self._tp_world_size}. Invalidating cache."
+                )
+                return 0
 
         t0 = _time.monotonic()
 
@@ -967,8 +1047,8 @@ class MemoryAwarePrefixCache:
         loaded = 0
         for entry_meta in index.get("entries", []):
             i = entry_meta["index"]
-            entry_path = os.path.join(cache_dir, f"entry_{i}.safetensors")
-            tokens_path = os.path.join(cache_dir, f"entry_{i}_tokens.bin")
+            entry_path = os.path.join(load_dir, f"entry_{i}.safetensors")
+            tokens_path = os.path.join(load_dir, f"entry_{i}_tokens.bin")
 
             if not os.path.exists(entry_path) or not os.path.exists(tokens_path):
                 logger.warning(f"[cache_persist] missing files for entry {i}, skipping")
@@ -1023,7 +1103,7 @@ class MemoryAwarePrefixCache:
 
         dt = _time.monotonic() - t0
         logger.info(
-            f"[cache_persist] LOADED {loaded} entries from {cache_dir} "
+            f"[cache_persist] LOADED {loaded} entries from {load_dir} "
             f"in {dt:.1f}s ({self._current_memory / _BYTES_PER_MB:.0f}MB total)"
         )
         return loaded
