@@ -344,6 +344,118 @@ def launch_distributed(
 # ---------------------------------------------------------------------------
 
 
+def _worker_spec_decode_step(
+    spec_plan,
+    batch_generator,
+    model,
+    communicator,
+    request_id_to_uid: dict,
+    uid_to_request_id: dict,
+) -> set[str]:
+    """Execute a speculative decoding step on a worker rank.
+
+    Workers mirror rank 0's spec decode path:
+    1. Build the same input tensor from SpecDecodePlan
+    2. Run model forward (TP all_sum synchronizes with rank 0)
+    3. Receive SpecDecodeResult from rank 0
+    4. Apply KV cache trim and batch state updates
+
+    Args:
+        spec_plan: SpecDecodePlan from StepPlan
+        batch_generator: The worker's BatchGenerator
+        model: The sharded model
+        communicator: MLXCommunicator
+        request_id_to_uid: request_id -> batch uid mapping
+        uid_to_request_id: batch uid -> request_id mapping
+
+    Returns:
+        Set of finished request IDs to remove from tracking
+    """
+    import mlx.core as mx
+
+    batch = batch_generator.active_batch
+    if batch is None:
+        # StepPlan sync should prevent this, but handle gracefully.
+        # We cannot run model forward without matching cache state,
+        # so TP all_sum may deadlock if rank 0 is running forward.
+        logger.error(
+            f"[Rank {communicator.rank}] spec_decode_plan received but no active batch. "
+            "Worker batch state is desynchronized from rank 0."
+        )
+        # Still receive the SpecDecodeResult to prevent hanging on the receive side.
+        # NOTE: The TP forward in rank 0 may hang if workers don't participate.
+        # This is a sync bug that should be investigated.
+        communicator.receive_spec_decode_result()
+        return set()
+
+    # 1. Build input tensor from SpecDecodePlan (must match rank 0 exactly)
+    batch_y = spec_plan.batch_y
+    max_draft_len = spec_plan.max_draft_len
+
+    input_rows = []
+    for rid, batch_idx in spec_plan.batch_order:
+        y_token = batch_y[batch_idx]
+        drafts = spec_plan.draft_tokens.get(rid, [])
+        padded_drafts = list(drafts) + [0] * (max_draft_len - len(drafts))
+        row = [y_token] + padded_drafts
+        input_rows.append(row)
+
+    input_tokens = mx.array(input_rows, dtype=mx.int32)  # (B_spec, max_k+1)
+
+    # 2. Run model forward (TP all_sum happens inside sharded model)
+    logits = model(input_tokens, cache=batch.cache)
+    # Eager eval is CRITICAL: completes the TP all_sum synchronization
+    # with rank 0 before we wait for SpecDecodeResult.
+    mx.eval(logits)
+
+    # 3. Receive SpecDecodeResult from rank 0
+    spec_result = communicator.receive_spec_decode_result()
+
+    # 4. Apply KV cache trim
+    if spec_result.trim_amounts and any(t > 0 for t in spec_result.trim_amounts):
+        trim_array = mx.array(spec_result.trim_amounts, dtype=mx.int32)
+        batch.cache.trim_per_sequence(trim_array)
+
+    # 5. Update batch state
+    # Set new batch.y
+    batch.y = mx.array(spec_result.new_y, dtype=mx.int32)
+    mx.eval(batch.y)
+
+    # Update tokens and num_tokens for each request
+    for rid, accepted in spec_result.accepted_tokens.items():
+        if rid not in request_id_to_uid:
+            continue
+        uid = request_id_to_uid[rid]
+        # Find batch index for this uid
+        batch_idx = None
+        for idx, b_uid in enumerate(batch.uids):
+            if b_uid == uid:
+                batch_idx = idx
+                break
+        if batch_idx is None:
+            continue
+
+        # Find original y for this position
+        orig_y = batch_y[batch_idx] if batch_idx < len(batch_y) else 0
+
+        # Append y (the token that was fed to model) to tokens
+        batch.tokens[batch_idx] = mx.concatenate(
+            (batch.tokens[batch_idx], mx.array([orig_y]))
+        )
+        # Append accepted drafts (all except last which becomes new batch.y)
+        tokens_for_cache = accepted[:-1] if accepted else []
+        for token in tokens_for_cache:
+            batch.tokens[batch_idx] = mx.concatenate(
+                (batch.tokens[batch_idx], mx.array([token]))
+            )
+        # Update num_tokens
+        n_committed = len(accepted)
+        batch.num_tokens[batch_idx] += n_committed
+
+    # 6. Return finished IDs for removal
+    return set(spec_result.finished_ids)
+
+
 def worker_loop(
     communicator: Any,
     model_name: str,
@@ -445,28 +557,95 @@ def worker_loop(
                         request_id_to_uid[insert_op.request_id] = uid
                         uid_to_request_id[uid] = insert_op.request_id
 
-                # Execute forward pass (model computation with all_sum).
-                # This must happen on all ranks simultaneously.
-                if request_id_to_uid:  # Only if there are active requests
-                    _responses = batch_generator.next()
+                # Verify fingerprint for batch sync detection
+                if plan.fingerprint:
+                    import hashlib
 
-                # Receive broadcast token IDs from rank 0.
-                # (rank 0 does the actual sampling and broadcasts)
-                if request_id_to_uid:
-                    num_active = len(request_id_to_uid)
-                    token_array = mx.zeros((num_active,), dtype=mx.int32)
-                    token_array = communicator.broadcast_tensor(token_array, src=0)
-                    mx.eval(token_array)
+                    local_running_ids = sorted(request_id_to_uid.keys())
+                    local_batch_size = (
+                        len(batch_generator.active_batch.uids)
+                        if batch_generator.active_batch
+                        else 0
+                    )
+                    local_fp_data = (
+                        ",".join(local_running_ids)
+                        + f"|step={plan.step_id}|batch={local_batch_size}"
+                    )
+                    local_fingerprint = hashlib.md5(
+                        local_fp_data.encode()
+                    ).hexdigest()[:16]
+                    if local_fingerprint != plan.fingerprint:
+                        logger.error(
+                            f"[Rank {rank}] BATCH DESYNC DETECTED! "
+                            f"Fingerprint mismatch: local={local_fingerprint}, "
+                            f"rank0={plan.fingerprint}, "
+                            f"local_requests={len(local_running_ids)}, "
+                            f"batch_size={local_batch_size}"
+                        )
 
-                    # Apply broadcast tokens to batch state for rank synchronization
-                    if batch_generator.active_batch is not None:
-                        batch_generator.active_batch.y = token_array
+                # Check if this step is a speculative decoding step
+                if plan.spec_decode_plan is not None:
+                    # Spec decode path: build input tensor + model forward + receive result
+                    finished_spec_ids = _worker_spec_decode_step(
+                        spec_plan=plan.spec_decode_plan,
+                        batch_generator=batch_generator,
+                        model=model,
+                        communicator=communicator,
+                        request_id_to_uid=request_id_to_uid,
+                        uid_to_request_id=uid_to_request_id,
+                    )
+                    # Remove finished requests
+                    for fid in finished_spec_ids:
+                        if fid in request_id_to_uid:
+                            uid = request_id_to_uid[fid]
+                            batch_generator.remove([uid])
+                            del request_id_to_uid[fid]
+                            del uid_to_request_id[uid]
+                else:
+                    # Normal decode path
+                    # Execute forward pass (model computation with all_sum).
+                    # This must happen on all ranks simultaneously.
+                    if request_id_to_uid:  # Only if there are active requests
+                        _responses = batch_generator.next()
+
+                    # Receive broadcast token IDs from rank 0.
+                    # Protocol: rank 0 sends broadcast_int(count) then
+                    # broadcast_tokens(token_ids). Workers must match
+                    # this exact sequence to stay synchronized.
+                    if request_id_to_uid:
+                        # Receive expected token count (matches rank 0's broadcast_int)
+                        num_tokens = communicator.broadcast_int(0, src=0)
+
+                        if num_tokens > 0:
+                            token_array = mx.zeros((num_tokens,), dtype=mx.int32)
+                            token_array = communicator.broadcast_tensor(token_array, src=0)
+                            mx.eval(token_array)
+
+                            # Apply broadcast tokens to batch state
+                            if batch_generator.active_batch is not None:
+                                batch = batch_generator.active_batch
+                                # Use actual batch size for shape validation
+                                num_active = len(batch.uids)
+                                if token_array.shape[0] != num_active:
+                                    logger.error(
+                                        f"[Rank {rank}] Token broadcast shape mismatch: "
+                                        f"received {token_array.shape[0]}, "
+                                        f"batch has {num_active}"
+                                    )
+                                batch.y = token_array
 
             except Exception as e:
                 if shutdown_event.is_set():
                     break
-                logger.error(f"[Rank {rank}] Error in StepPlan loop: {e}")
-                raise
+                logger.error(
+                    f"[Rank {rank}] Fatal error in StepPlan loop: {e}",
+                    exc_info=True,
+                )
+                # Worker cannot continue -- any further broadcast will
+                # deadlock.  The only safe action is to exit and let
+                # rank 0's next all_sum operation fail with a
+                # timeout/error.
+                break
 
     finally:
         signal.signal(signal.SIGTERM, original_sigterm)
@@ -594,12 +773,9 @@ def _run_rank0_server(
     # Phase 0: Just start the server normally.
     # Phase 2 will integrate the communicator with EngineCore/Scheduler
     # so that StepPlans are broadcast to worker ranks.
-    if server_args is not None:
-        sys.argv = [sys.argv[0]] + server_args
-
     from .server import main as server_main
 
-    server_main()
+    server_main(argv=server_args)
 
 
 # ---------------------------------------------------------------------------

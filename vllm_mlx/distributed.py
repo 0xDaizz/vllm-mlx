@@ -43,6 +43,7 @@ class StepPlan:
     removes: list[str]  # request_ids to remove
     sampling_seeds: dict[str, int]  # per-request RNG seeds
     fingerprint: str  # batch composition hash for sync verification
+    spec_decode_plan: SpecDecodePlan | None = None
 
 
 @dataclass
@@ -51,6 +52,27 @@ class StepResult:
 
     step_id: int
     token_ids: dict[str, int]  # request_id -> sampled token
+
+
+@dataclass
+class SpecDecodePlan:
+    """Draft proposal plan broadcast from rank 0 to workers for TP spec decode."""
+
+    draft_tokens: dict[str, list[int]]  # request_id → draft token IDs
+    max_draft_len: int  # max draft length for padding alignment
+    batch_order: list[tuple[str, int]]  # (request_id, batch_idx) order
+    batch_y: list[int]  # current batch.y values per position (for input tensor construction)
+
+
+@dataclass
+class SpecDecodeResult:
+    """Result of rejection sampling, broadcast from rank 0 to workers."""
+
+    step_id: int  # matches StepPlan.step_id for phase-1/phase-2 sanity check
+    accepted_tokens: dict[str, list[int]]  # committed tokens per request
+    trim_amounts: list[int]  # KV cache trim per batch position
+    new_y: list[int]  # new batch.y values per batch position
+    finished_ids: list[str]  # request IDs that completed during spec decode
 
 
 # ---------------------------------------------------------------------------
@@ -154,6 +176,9 @@ class MLXCommunicator:
 
         Non-source ranks substitute a zeros tensor of the same shape and
         dtype so that ``all_sum`` reproduces the original.
+
+        The result is eagerly evaluated to ensure the all_sum completes
+        before any subsequent communication.
         """
         if not self.is_distributed:
             return tensor
@@ -161,20 +186,23 @@ class MLXCommunicator:
         import mlx.core as mx
 
         if self._rank == src:
-            return mx.distributed.all_sum(tensor, group=self._group)
+            result = mx.distributed.all_sum(tensor, group=self._group)
         else:
-            return mx.distributed.all_sum(
+            result = mx.distributed.all_sum(
                 mx.zeros_like(tensor), group=self._group
             )
+        mx.eval(result)
+        return result
 
     def broadcast_object(self, obj: Any, src: int = 0) -> Any:
         """Broadcast an arbitrary picklable object from *src* to all.
 
-        Protocol (mirrors the mlx-lm server pattern):
+        Protocol:
         1. Source rank pickles the object to bytes.
         2. Broadcast the byte-length as an integer.
         3. Convert the bytes to a ``uint8`` array and broadcast.
-        4. Every rank unpickles the result.
+        4. Broadcast a CRC32 checksum for integrity verification.
+        5. Every rank unpickles the result.
 
         When *src* is the calling rank the original *obj* is returned
         directly (avoids a redundant pickle round-trip on that rank).
@@ -182,15 +210,21 @@ class MLXCommunicator:
         if not self.is_distributed:
             return obj
 
+        import zlib
+
         import mlx.core as mx
 
         if self._rank == src:
-            data = mx.array(list(pickle.dumps(obj)), dtype=mx.uint8)
+            raw = pickle.dumps(obj)
+            data = mx.array(list(raw), dtype=mx.uint8)
             size = data.size
+            checksum = zlib.crc32(raw) & 0xFFFFFFFF
             # Broadcast size
             mx.eval(mx.distributed.all_sum(mx.array(size), group=self._group))
             # Broadcast data
             mx.eval(mx.distributed.all_sum(data, group=self._group))
+            # Broadcast checksum
+            mx.eval(mx.distributed.all_sum(mx.array(checksum, dtype=mx.uint32), group=self._group))
             return obj
         else:
             # Receive size
@@ -201,7 +235,20 @@ class MLXCommunicator:
             data = mx.distributed.all_sum(
                 mx.zeros(size, dtype=mx.uint8), group=self._group
             )
-            return pickle.loads(bytes(data.tolist()))
+            mx.eval(data)
+            raw = bytes(data.tolist())
+            # Receive and verify checksum
+            expected_checksum = mx.distributed.all_sum(
+                mx.array(0, dtype=mx.uint32), group=self._group
+            ).item()
+            actual_checksum = zlib.crc32(raw) & 0xFFFFFFFF
+            if actual_checksum != expected_checksum:
+                raise RuntimeError(
+                    f"broadcast_object integrity check failed: "
+                    f"expected CRC32={expected_checksum:#010x}, "
+                    f"got {actual_checksum:#010x} (size={size})"
+                )
+            return pickle.loads(raw)
 
     # -- high-level helpers -------------------------------------------------
 
@@ -232,27 +279,29 @@ class MLXCommunicator:
     def broadcast_tokens(self, token_ids, src: int = 0):
         """Broadcast sampled token IDs from *src* to every rank.
 
-        Rank 0 samples tokens and uses this to synchronize all workers
-        so that KV caches stay consistent.
+        Convenience wrapper around :meth:`broadcast_tensor`.
+        """
+        return self.broadcast_tensor(token_ids, src=src)
 
-        Args:
-            token_ids: An ``mx.array`` of sampled token IDs.
-            src: The rank that performed the sampling.
+    def broadcast_spec_decode_result(self, result: SpecDecodeResult) -> None:
+        """Broadcast a SpecDecodeResult from rank 0 to all workers.
 
-        Returns:
-            The token ID array available on every rank.
+        Called after rank 0 performs rejection sampling. Workers need
+        the result to update their KV cache and batch state.
         """
         if not self.is_distributed:
-            return token_ids
-
-        import mlx.core as mx
-
-        if self._rank == src:
-            return mx.distributed.all_sum(token_ids, group=self._group)
-        else:
-            return mx.distributed.all_sum(
-                mx.zeros_like(token_ids), group=self._group
+            return
+        if self._rank != 0:
+            logger.warning(
+                "broadcast_spec_decode_result called on rank %d; "
+                "use receive_spec_decode_result on non-zero ranks",
+                self._rank,
             )
+        self.broadcast_object(result, src=0)
+
+    def receive_spec_decode_result(self) -> SpecDecodeResult:
+        """Receive a SpecDecodeResult on a non-rank-0 worker."""
+        return self.broadcast_object(None, src=0)
 
 
 # ---------------------------------------------------------------------------

@@ -2113,8 +2113,19 @@ async def init_mcp(config_path: str):
 # =============================================================================
 
 
-def main():
-    """Run the server."""
+def main(argv=None):
+    """Run the server.
+
+    Parameters
+    ----------
+    argv : list[str] | None
+        Command-line arguments to parse.  When *None* (the default),
+        ``sys.argv[1:]`` is used.  Passing an explicit list allows
+        callers such as ``distributed_launcher.py`` to invoke the
+        server without manipulating ``sys.argv``.
+    """
+    from .cli_args import add_all_serve_args, build_scheduler_config, validate_serve_args
+
     parser = argparse.ArgumentParser(
         description="vllm-mlx OpenAI-compatible server for LLM and MLLM inference",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -2130,119 +2141,10 @@ Examples:
     python -m vllm_mlx.server --model mlx-community/Qwen3-4B-4bit --mcp-config mcp.json
         """,
     )
-    parser.add_argument(
-        "--model",
-        type=str,
-        default="mlx-community/Llama-3.2-3B-Instruct-4bit",
-        help="Model to load (HuggingFace model name or local path)",
-    )
-    parser.add_argument(
-        "--host",
-        type=str,
-        default="0.0.0.0",
-        help="Host to bind to",
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=8000,
-        help="Port to bind to",
-    )
-    parser.add_argument(
-        "--mllm",
-        action="store_true",
-        help="Force loading as MLLM (multimodal language model)",
-    )
-    parser.add_argument(
-        "--continuous-batching",
-        action="store_true",
-        help="Enable continuous batching for multiple concurrent users",
-    )
-    parser.add_argument(
-        "--mcp-config",
-        type=str,
-        default=None,
-        help="Path to MCP configuration file (JSON/YAML)",
-    )
-    parser.add_argument(
-        "--max-tokens",
-        type=int,
-        default=32768,
-        help="Default max tokens for generation",
-    )
-    parser.add_argument(
-        "--api-key",
-        type=str,
-        default=None,
-        help="API key for authentication (if not set, no auth required)",
-    )
-    parser.add_argument(
-        "--timeout",
-        type=float,
-        default=300.0,
-        help="Default request timeout in seconds (default: 300)",
-    )
-    parser.add_argument(
-        "--rate-limit",
-        type=int,
-        default=0,
-        help="Rate limit requests per minute per client (0 = disabled)",
-    )
-    # Reasoning parser options - choices loaded dynamically from registry
-    from .reasoning import list_parsers
+    add_all_serve_args(parser, positional_model=False)
 
-    reasoning_choices = list_parsers()
-    parser.add_argument(
-        "--reasoning-parser",
-        type=str,
-        default=None,
-        choices=reasoning_choices,
-        help=(
-            "Enable reasoning content extraction with specified parser. "
-            f"Options: {', '.join(reasoning_choices)}."
-        ),
-    )
-    parser.add_argument(
-        "--embedding-model",
-        type=str,
-        default=None,
-        help="Pre-load an embedding model at startup (e.g. mlx-community/all-MiniLM-L6-v2-4bit)",
-    )
-    parser.add_argument(
-        "--default-temperature",
-        type=float,
-        default=None,
-        help="Default temperature for generation when not specified in request",
-    )
-    parser.add_argument(
-        "--default-top-p",
-        type=float,
-        default=None,
-        help="Default top_p for generation when not specified in request",
-    )
-
-    # Speculative decoding options
-    parser.add_argument(
-        "--speculative-method",
-        type=str,
-        default=None,
-        choices=["ngram"],
-        help="Enable speculative decoding with the specified method (e.g., 'ngram')",
-    )
-    parser.add_argument(
-        "--num-speculative-tokens",
-        type=int,
-        default=3,
-        help="Number of draft tokens per speculative decoding step (default: 3)",
-    )
-    parser.add_argument(
-        "--spec-decode-disable-batch-size",
-        type=int,
-        default=None,
-        help="Disable speculative decoding when batch size exceeds this threshold",
-    )
-
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    validate_serve_args(args)
 
     # Set global configuration
     global _api_key, _default_timeout, _rate_limiter
@@ -2289,19 +2191,19 @@ Examples:
         _reasoning_parser = parser_cls()
         logger.info(f"Reasoning parser enabled: {args.reasoning_parser}")
 
+    # Configure tool calling
+    if getattr(args, 'enable_auto_tool_choice', False) and getattr(args, 'tool_call_parser', None):
+        global _enable_auto_tool_choice, _tool_call_parser
+        _enable_auto_tool_choice = True
+        _tool_call_parser = args.tool_call_parser
+
     # Pre-load embedding model if specified
     load_embedding_model(args.embedding_model, lock=True)
 
-    # Build scheduler config with spec decode settings
+    # Build scheduler config
     scheduler_config = None
     if args.continuous_batching:
-        from vllm_mlx.scheduler import SchedulerConfig
-
-        scheduler_config = SchedulerConfig(
-            speculative_method=args.speculative_method,
-            num_speculative_tokens=args.num_speculative_tokens,
-            spec_decode_disable_batch_size=args.spec_decode_disable_batch_size,
-        )
+        scheduler_config = build_scheduler_config(args)
 
     # Load model before starting server
     load_model(
@@ -2310,6 +2212,7 @@ Examples:
         max_tokens=args.max_tokens,
         force_mllm=args.mllm,
         scheduler_config=scheduler_config,
+        stream_interval=args.stream_interval if args.continuous_batching else 1,
     )
 
     # Start server

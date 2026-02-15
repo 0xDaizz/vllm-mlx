@@ -758,11 +758,6 @@ class Scheduler:
             return False
         if self.batch_generator.active_batch is None:
             return False
-        # Disable spec decode under TP — workers run batch_generator.next()
-        # which expects 1-token input, not the (B, k+1) verify tensor.
-        # TP + spec decode integration is Phase 5 work.
-        if self._communicator is not None and self._communicator.is_distributed:
-            return False
         if self.waiting:  # Pending prefills -- run normal step
             return False
         # Don't spec decode if there are unprocessed prompts waiting for prefill
@@ -778,6 +773,292 @@ class Scheduler:
             if model_type in ("mamba", "jamba", "nemotron"):
                 return False
         return True
+
+    def _build_spec_decode_plan(self):
+        """Build a SpecDecodePlan for TP broadcast.
+
+        Extracts draft proposal logic from _step_spec_decode() into a
+        separate method. Returns (plan, pending_state) or (None, None)
+        if no drafts were generated.
+
+        The pending_state is saved so _step_spec_decode_tp() can continue
+        after model forward without re-proposing.
+        """
+        from vllm_mlx.distributed import SpecDecodePlan
+
+        batch = self.batch_generator.active_batch
+        runtime = self._spec_decode_runtime
+        k = runtime.config.num_speculative_tokens
+
+        # 1. Build request states (same as _step_spec_decode steps 1-2)
+        request_states = {}
+        uid_to_request_id_local = {}
+        for i, uid in enumerate(batch.uids):
+            request_id = self.uid_to_request_id.get(uid)
+            if request_id is None:
+                continue
+            request = self.running.get(request_id)
+            if request is None:
+                continue
+            token_ids = list(request.prompt_token_ids or []) + list(
+                request.output_token_ids
+            )
+            request_states[request_id] = RequestState(
+                request_id=request_id,
+                token_ids=token_ids,
+                batch_uid=uid,
+            )
+            uid_to_request_id_local[uid] = request_id
+
+        if not request_states:
+            return None, None
+
+        # 2. Propose drafts
+        draft_metadata = runtime.propose_drafts(request_states)
+
+        # 3. Map request order to batch indices
+        batch_request_ids = []
+        batch_indices = []
+        for i, uid in enumerate(batch.uids):
+            rid = uid_to_request_id_local.get(uid)
+            if rid and rid in request_states:
+                batch_request_ids.append(rid)
+                batch_indices.append(i)
+
+        if not batch_request_ids:
+            return None, None
+
+        # 4. Compute per-request draft lengths
+        max_draft_len = 0
+        draft_per_request = {}
+        for rid in batch_request_ids:
+            drafts = draft_metadata.get_draft_tokens(rid)
+            draft_per_request[rid] = drafts
+            max_draft_len = max(max_draft_len, len(drafts))
+
+        if max_draft_len == 0:
+            return None, None  # No drafts — caller should use normal path
+
+        # 5. Build batch_y and batch_order
+        batch_y = batch.y.tolist()
+        batch_order = [(rid, batch_indices[i]) for i, rid in enumerate(batch_request_ids)]
+
+        plan = SpecDecodePlan(
+            draft_tokens={rid: draft_per_request[rid] for rid in batch_request_ids},
+            max_draft_len=max_draft_len,
+            batch_order=batch_order,
+            batch_y=batch_y,
+        )
+
+        # Save intermediate state for _step_spec_decode_tp()
+        pending_state = {
+            "draft_metadata": draft_metadata,
+            "batch_request_ids": batch_request_ids,
+            "batch_indices": batch_indices,
+            "draft_per_request": draft_per_request,
+            "max_draft_len": max_draft_len,
+            "uid_to_request_id_local": uid_to_request_id_local,
+            "batch_y": batch_y,
+        }
+
+        return plan, pending_state
+
+    def _step_spec_decode_tp(self, pending_state: dict) -> list | None:
+        """Execute spec decode step in TP mode.
+
+        Assumes:
+        - _build_spec_decode_plan() already ran and built pending_state
+        - StepPlan (with spec_decode_plan) was already broadcast
+        - All ranks ran model forward simultaneously (TP all_sum)
+        - Now rank 0 does rejection sampling and broadcasts result
+
+        This method reuses most of _step_spec_decode() logic but:
+        1. Skips draft proposal (already done in _build_spec_decode_plan)
+        2. Skips model forward (already done by step() caller)
+        3. Starts from rejection sampling
+        4. Broadcasts SpecDecodeResult to workers
+
+        Returns list of Response objects, or None if fallback needed.
+        """
+        from vllm_mlx.distributed import SpecDecodeResult
+
+        batch = self.batch_generator.active_batch
+        runtime = self._spec_decode_runtime
+
+        draft_metadata = pending_state["draft_metadata"]
+        batch_request_ids = pending_state["batch_request_ids"]
+        batch_indices = pending_state["batch_indices"]
+        draft_per_request = pending_state["draft_per_request"]
+        max_draft_len = pending_state["max_draft_len"]
+        uid_to_request_id_local = pending_state["uid_to_request_id_local"]
+        batch_y = pending_state["batch_y"]
+
+        # Compute draft_lengths for each batch request
+        draft_lengths = [len(draft_per_request[rid]) for rid in batch_request_ids]
+
+        # Build input tensor (same as workers did) for logits extraction
+        input_rows = []
+        for rid, batch_idx in zip(batch_request_ids, batch_indices):
+            y_token = batch_y[batch_idx]
+            drafts = draft_per_request[rid]
+            padded_drafts = list(drafts) + [0] * (max_draft_len - len(drafts))
+            row = [y_token] + padded_drafts
+            input_rows.append(row)
+
+        input_tokens = mx.array(input_rows, dtype=mx.int32)
+
+        # Run model forward (TP all_sum happens inside)
+        logits = self.model(input_tokens, cache=batch.cache)
+        mx.eval(logits)
+
+        # Build VerifyResult
+        verify_result = VerifyResult()
+        verify_result.request_ids = list(batch_request_ids)
+        for i, rid in enumerate(batch_request_ids):
+            num_drafts = draft_lengths[i]
+            req_logits = logits[i, : num_drafts + 1, :]
+            verify_result.target_logits[rid] = req_logits
+
+        # Rejection sampling
+        accept_results = runtime.accept_and_commit(verify_result, draft_metadata)
+
+        # Build Response objects and compute rollback/trim (same as _step_spec_decode)
+        responses = []
+        stop_tokens = self._get_stop_tokens()
+        rollback_counts = {}
+        finished_in_spec = []
+
+        for i, rid in enumerate(batch_request_ids):
+            batch_idx = batch_indices[i]
+            uid = batch.uids[batch_idx]
+            result = accept_results.get(rid)
+            if result is None:
+                continue
+
+            request = self.running.get(rid)
+            if request is None:
+                continue
+
+            tokens_remaining = (
+                request.sampling_params.max_tokens - request.num_output_tokens
+            )
+
+            for t_idx, token in enumerate(result.accepted_tokens):
+                if tokens_remaining <= 0:
+                    unemitted = len(result.accepted_tokens) - t_idx
+                    rollback_counts[rid] = rollback_counts.get(rid, 0) + unemitted
+                    break
+
+                finish_reason = None
+                if token in stop_tokens:
+                    finish_reason = "stop"
+                elif tokens_remaining == 1:
+                    finish_reason = "length"
+
+                resp = type(
+                    "Response", (),
+                    {"uid": uid, "token": token, "finish_reason": finish_reason, "prompt_cache": None},
+                )()
+                responses.append(resp)
+                tokens_remaining -= 1
+
+                if finish_reason is not None:
+                    unemitted = len(result.accepted_tokens) - t_idx - 1
+                    if unemitted > 0:
+                        rollback_counts[rid] = rollback_counts.get(rid, 0) + unemitted
+                    finished_in_spec.append(rid)
+                    break
+
+            rollback_counts[rid] = rollback_counts.get(rid, 0) + result.rollback_count
+
+        # Compute trim amounts
+        trim_amounts = []
+        for batch_idx in range(len(batch.uids)):
+            uid = batch.uids[batch_idx]
+            rid = uid_to_request_id_local.get(uid)
+            if rid and rid in rollback_counts:
+                actual_drafts = (
+                    draft_lengths[batch_request_ids.index(rid)]
+                    if rid in batch_request_ids
+                    else 0
+                )
+                padding_trim = max_draft_len - actual_drafts
+                total_trim = rollback_counts[rid] + padding_trim
+                trim_amounts.append(total_trim)
+            else:
+                trim_amounts.append(max_draft_len)
+
+        if any(t > 0 for t in trim_amounts):
+            trim_array = mx.array(trim_amounts, dtype=mx.int32)
+            batch.cache.trim_per_sequence(trim_array)
+
+        # Update batch state (new_y, logprobs, tokens, num_tokens)
+        new_y = []
+        new_logprobs = []
+        for batch_idx in range(len(batch.uids)):
+            uid = batch.uids[batch_idx]
+            rid = uid_to_request_id_local.get(uid)
+            if rid and rid in accept_results:
+                result = accept_results[rid]
+                i = batch_request_ids.index(rid)
+                if result.accepted_tokens:
+                    new_y.append(result.accepted_tokens[-1])
+                    correction_pos = result.num_accepted
+                    req_logits = verify_result.target_logits[rid]
+                    if correction_pos < req_logits.shape[0]:
+                        log_probs = mx.softmax(req_logits[correction_pos], axis=-1)
+                        log_probs = mx.log(log_probs + 1e-12)
+                        new_logprobs.append(log_probs)
+                    else:
+                        log_probs = mx.softmax(req_logits[-1], axis=-1)
+                        log_probs = mx.log(log_probs + 1e-12)
+                        new_logprobs.append(log_probs)
+                else:
+                    new_y.append(batch_y[batch_idx])
+                    new_logprobs.append(
+                        batch.logprobs[batch_idx] if batch.logprobs else mx.zeros((1,))
+                    )
+            else:
+                new_y.append(batch_y[batch_idx])
+                new_logprobs.append(
+                    batch.logprobs[batch_idx] if batch.logprobs else mx.zeros((1,))
+                )
+
+        batch.y = mx.array(new_y, dtype=mx.int32)
+        batch.logprobs = new_logprobs
+
+        # Update tokens list
+        for rid in accept_results:
+            result = accept_results[rid]
+            if rid in batch_request_ids:
+                i = batch_request_ids.index(rid)
+                batch_idx = batch_indices[i]
+                batch.tokens[batch_idx] = mx.concatenate(
+                    (batch.tokens[batch_idx], mx.array([batch_y[batch_idx]]))
+                )
+                tokens_for_cache = result.accepted_tokens[:-1] if result.accepted_tokens else []
+                for token in tokens_for_cache:
+                    batch.tokens[batch_idx] = mx.concatenate(
+                        (batch.tokens[batch_idx], mx.array([token]))
+                    )
+                n_committed = len(result.accepted_tokens)
+                batch.num_tokens[batch_idx] += n_committed
+
+        mx.eval(batch.y)
+
+        # Broadcast SpecDecodeResult to workers
+        if self._communicator is not None and self._communicator.is_distributed:
+            # Compute new_y list for workers
+            spec_result = SpecDecodeResult(
+                step_id=self._step_count,
+                accepted_tokens={rid: accept_results[rid].accepted_tokens for rid in accept_results if rid in batch_request_ids},
+                trim_amounts=trim_amounts,
+                new_y=new_y,
+                finished_ids=finished_in_spec,
+            )
+            self._communicator.broadcast_spec_decode_result(spec_result)
+
+        return responses
 
     def _step_spec_decode(self) -> Optional[list]:
         """Execute one speculative decoding step.
@@ -2089,12 +2370,15 @@ class Scheduler:
             return
 
         if not responses:
+            # Broadcast size=0 so workers know there are no tokens
+            self._communicator.broadcast_int(0, src=0)
             return
 
-        # Extract token IDs from responses (rank 0 has the real ones)
+        # Broadcast token count first for size validation
         token_ids = mx.array([r.token for r in responses], dtype=mx.int32)
+        self._communicator.broadcast_int(len(responses), src=0)
 
-        # Broadcast from rank 0 to all
+        # Broadcast token array
         token_ids = self._communicator.broadcast_tokens(token_ids, src=0)
         mx.eval(token_ids)
 
@@ -2103,7 +2387,7 @@ class Scheduler:
         for i, response in enumerate(responses):
             response.token = token_list[i]
 
-    def _build_step_plan(self, scheduled: list, finished_ids: set, token_ids: dict | None = None) -> "StepPlan":
+    def _build_step_plan(self, scheduled: list, finished_ids: set, token_ids: dict | None = None, spec_decode_plan=None) -> "StepPlan":
         """Build a StepPlan from the current scheduling state.
 
         Args:
@@ -2139,13 +2423,10 @@ class Scheduler:
 
         removes = list(finished_ids) if finished_ids else []
 
-        # Pending aborts also need to be removed on all ranks
-        abort_ids = list(self._pending_abort_ids)
-        removes.extend(abort_ids)
-
         # Build fingerprint from current running request IDs for sync verification
         running_ids = sorted(self.running.keys())
-        fp_data = ",".join(running_ids) + f"|step={self._step_count}"
+        batch_size = len(self.batch_generator.active_batch.uids) if self.batch_generator and self.batch_generator.active_batch else 0
+        fp_data = ",".join(running_ids) + f"|step={self._step_count}|batch={batch_size}"
         fingerprint = hashlib.md5(fp_data.encode()).hexdigest()[:16]
 
         # Sampling seeds (for deterministic sampling across ranks)
@@ -2159,6 +2440,7 @@ class Scheduler:
             removes=removes,
             sampling_seeds=seeds,
             fingerprint=fingerprint,
+            spec_decode_plan=spec_decode_plan,
         )
 
     def step(self, max_retries: int = 1) -> SchedulerOutput:
@@ -2191,22 +2473,94 @@ class Scheduler:
                     r.num_prompt_tokens for r in scheduled
                 )
 
+                # Determine spec decode eligibility BEFORE StepPlan broadcast
+                # so workers know whether to expect a spec decode step
+                spec_plan = None
+                spec_pending_state = None
+                if self.batch_generator is not None and self.running and self._can_spec_decode():
+                    spec_plan, spec_pending_state = self._build_spec_decode_plan()
+
                 # TP: Broadcast StepPlan BEFORE batch_generator.next()
                 # Workers need inserts/removes before running the forward pass
                 if self._communicator is not None and self._communicator.is_distributed:
-                    plan = self._build_step_plan(scheduled, self._pending_distributed_removes)
+                    plan = self._build_step_plan(
+                        scheduled, self._pending_distributed_removes,
+                        spec_decode_plan=spec_plan,
+                    )
                     self._communicator.broadcast_step_plan(plan)
-                    self._pending_distributed_removes.clear()  # Clear after broadcast
+                    self._pending_distributed_removes.clear()
 
                 # Run generation step if we have running requests
                 if self.batch_generator is not None and self.running:
-                    # Try speculative decoding path
-                    if self._can_spec_decode():
+                    if spec_plan is not None and spec_pending_state is not None:
+                        # TP-aware spec decode path
+                        try:
+                            spec_responses = self._step_spec_decode_tp(spec_pending_state)
+                        except Exception as spec_err:
+                            # CRITICAL: Workers are waiting for SpecDecodeResult.
+                            # Send a no-op result so they don't deadlock.
+                            logger.error(
+                                f"Spec decode TP failed, sending no-op result to workers: {spec_err}"
+                            )
+                            if self._communicator is not None and self._communicator.is_distributed:
+                                from vllm_mlx.distributed import SpecDecodeResult
+                                batch = self.batch_generator.active_batch
+                                noop_result = SpecDecodeResult(
+                                    step_id=self._step_count,
+                                    accepted_tokens={},
+                                    trim_amounts=[spec_pending_state["max_draft_len"]] * len(batch.uids) if batch else [],
+                                    new_y=spec_pending_state["batch_y"],
+                                    finished_ids=[],
+                                )
+                                self._communicator.broadcast_spec_decode_result(noop_result)
+                                # Apply the same rollback on rank 0 to keep state consistent
+                                if batch is not None and noop_result.trim_amounts:
+                                    import mlx.core as mx
+                                    if any(t > 0 for t in noop_result.trim_amounts):
+                                        trim_array = mx.array(noop_result.trim_amounts, dtype=mx.int32)
+                                        batch.cache.trim_per_sequence(trim_array)
+                                    batch.y = mx.array(noop_result.new_y, dtype=mx.int32)
+                            spec_responses = None
+
+                        if spec_responses is not None:
+                            responses = spec_responses
+                            output.has_work = True
+                            if responses:
+                                outputs, finished_ids = (
+                                    self._process_batch_responses(responses)
+                                )
+                                output.outputs = outputs
+                                output.finished_request_ids = finished_ids
+                                self._cleanup_finished(finished_ids)
+                        else:
+                            # Spec decode returned None or failed -- fall back to normal decode.
+                            # NOTE: In TP mode, workers already ran model forward in spec decode
+                            # path, so we CANNOT call batch_generator.next() here (would
+                            # cause a second TP forward while workers are not expecting it).
+                            # Instead, we must skip this step and let the next step handle it.
+                            if self._communicator is not None and self._communicator.is_distributed:
+                                # Workers already consumed a model forward in spec decode step.
+                                # We cannot do another forward. Just proceed with no output.
+                                logger.warning("Spec decode fallback in TP mode: skipping step")
+                                output.has_work = False
+                            else:
+                                # Non-TP fallback path (should not reach here, but safety net)
+                                responses = self.batch_generator.next()
+                                output.has_work = True
+                                self._broadcast_sampled_tokens(responses)
+                                if responses:
+                                    outputs, finished_ids = (
+                                        self._process_batch_responses(responses)
+                                    )
+                                    output.outputs = outputs
+                                    output.finished_request_ids = finished_ids
+                                    self._cleanup_finished(finished_ids)
+                    elif self._can_spec_decode() and (self._communicator is None or not self._communicator.is_distributed):
+                        # Non-distributed spec decode path (existing logic, single-node only)
                         spec_responses = self._step_spec_decode()
                         if spec_responses is not None:
                             responses = spec_responses
                             output.has_work = True
-                            # TP: Broadcast spec decode tokens
                             self._broadcast_sampled_tokens(responses)
                             if responses:
                                 outputs, finished_ids = (
@@ -2216,7 +2570,6 @@ class Scheduler:
                                 output.finished_request_ids = finished_ids
                                 self._cleanup_finished(finished_ids)
                         else:
-                            # Spec decode returned None (no drafts) -- fall back
                             responses = self.batch_generator.next()
                             output.has_work = True
                             self._broadcast_sampled_tokens(responses)
@@ -2230,10 +2583,7 @@ class Scheduler:
                     else:
                         responses = self.batch_generator.next()
                         output.has_work = True
-
-                        # TP: Broadcast sampled tokens from rank 0 to all ranks
                         self._broadcast_sampled_tokens(responses)
-
                         if responses:
                             outputs, finished_ids = (
                                 self._process_batch_responses(responses)

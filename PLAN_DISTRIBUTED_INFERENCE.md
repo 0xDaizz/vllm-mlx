@@ -3,7 +3,7 @@
 > TB5 + JACCL + RDMA 기반 Tensor Parallelism + Speculative Decoding
 >
 > 생성일: 2026-02-14
-> 상태: Phase 0-3 (TP) + Phase 4a-4b (Spec Decode) 구현 완료, Phase 5 대기
+> 상태: Phase 0-4b 구현 완료, Phase 5 (TP+Spec Decode 통합) 구현 완료
 
 ---
 
@@ -366,7 +366,7 @@
 
 - [x] `_cleanup_finished()`에 `batch_generator.remove([uid])` 추가 (finished UID 미제거 버그)
 - [x] `_can_spec_decode()`에 `unprocessed_prompts` 체크 추가 (insert=enqueue만)
-- [x] `_can_spec_decode()`에 TP guard 추가 (Phase 5까지 TP+Spec 비활성화)
+- [x] `_can_spec_decode()`에 TP guard 추가 → **Phase 5에서 제거됨** (TP+Spec 통합 완료)
 - [x] `distributed_launcher.py`: `remove(uid)` → `remove([uid])` 수정
 - [x] `distributed_launcher.py`: worker broadcast 토큰을 `active_batch.y`에 적용
 - [x] `distributed_launcher.py`: BatchGenerator import 경로 수정 (`mlx_lm.generate`)
@@ -413,10 +413,10 @@
 
 #### Draft Proposal 분산
 
-- [ ] Ngram proposer 분산 지원
-  - [ ] rank 0에서만 ngram propose
-  - [ ] draft token IDs를 StepPlan에 포함하여 broadcast
-  - [ ] 모든 rank에서 동일한 draft tokens로 verify
+- [x] Ngram proposer 분산 지원
+  - [x] rank 0에서만 ngram propose
+  - [x] draft token IDs를 StepPlan에 포함하여 broadcast
+  - [x] 모든 rank에서 동일한 draft tokens로 verify
 
 - [ ] EAGLE proposer 분산 지원
   - [ ] draft_tp=1 모드: rank 0에서만 EAGLE forward
@@ -425,23 +425,23 @@
 
 #### Verify Phase 분산
 
-- [ ] 모든 rank에서 draft tokens 포함한 verify forward 실행
-- [ ] TP all_sum 자동 처리 확인 (sharded model 내부)
-- [ ] rank 0에서 rejection sampling 실행
-- [ ] rejection result broadcast -> 모든 rank 반영
+- [x] 모든 rank에서 draft tokens 포함한 verify forward 실행
+- [x] TP all_sum 자동 처리 확인 (sharded model 내부)
+- [x] rank 0에서 rejection sampling 실행
+- [x] rejection result broadcast -> 모든 rank 반영
 
 #### KV Cache Rollback 분산
 
-- [ ] 모든 rank에서 동일한 rollback count 적용
-- [ ] rank 0이 결정 -> broadcast -> 각 rank local cache 조정
+- [x] 모든 rank에서 동일한 rollback count 적용
+- [x] rank 0이 결정 -> broadcast -> 각 rank local cache 조정
 - [ ] rollback 후 batch fingerprint 일관성 검증
 
 #### StepPlan 프로토콜 확장
 
-- [ ] StepPlan에 spec decode 필드 추가
-  - [ ] `draft_token_ids: Dict[str, List[int]]`
-  - [ ] `verify_results: Dict[str, RejectionResult]`
-  - [ ] `rollback_counts: Dict[str, int]`
+- [x] StepPlan에 spec decode 필드 추가
+  - [x] `spec_decode_plan: SpecDecodePlan | None` (draft_tokens, max_draft_len, batch_order, batch_y)
+  - [x] `SpecDecodeResult` broadcast 프로토콜 (accepted_tokens, trim_amounts, new_y, finished_ids)
+  - [x] `MLXCommunicator.broadcast_spec_decode_result()` / `receive_spec_decode_result()`
 
 #### 테스트 및 검증
 
@@ -450,6 +450,9 @@
 - [ ] greedy 정합성: TP+Spec vs 단일노드 결과 동일
 - [ ] throughput: TP+Spec vs TP-only vs Spec-only 비교
 - [ ] 4-node 클러스터 테스트 (가능한 경우)
+- [x] TP guard 제거 후 `_can_spec_decode` unit test (2개)
+- [x] Worker spec decode step mock test (3개)
+- [x] SpecDecodePlan/SpecDecodeResult 직렬화 round-trip test (6개)
 
 ---
 

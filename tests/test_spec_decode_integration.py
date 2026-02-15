@@ -1084,3 +1084,221 @@ class TestStatsIntegration:
         assert rates[0] == 1.0  # 2/2
         assert rates[1] == 0.5  # 1/2
         assert rates[2] == 0.5  # 1/2
+
+
+# ======================================================================
+# TestCanSpecDecodeTP
+# ======================================================================
+
+
+class TestCanSpecDecodeTP:
+    """Test that _can_spec_decode allows spec decode under TP (Phase 5)."""
+
+    def _make_scheduler_mock(self, **kwargs):
+        """Create a minimal mock scheduler with spec decode fields."""
+        scheduler = MagicMock()
+        scheduler.config = SchedulerConfig(speculative_method="ngram")
+        scheduler._spec_decode_enabled = kwargs.get("enabled", True)
+        scheduler._spec_decode_runtime = kwargs.get("runtime", MagicMock())
+        scheduler.batch_generator = kwargs.get("batch_generator", MagicMock())
+        if scheduler.batch_generator is not None:
+            scheduler.batch_generator.unprocessed_prompts = kwargs.get("unprocessed_prompts", [])
+        if "active_batch" in kwargs:
+            scheduler.batch_generator.active_batch = kwargs["active_batch"]
+        scheduler.waiting = kwargs.get("waiting", deque())
+        scheduler.running = kwargs.get("running", {"req1": MagicMock()})
+        scheduler._communicator = kwargs.get("communicator", None)
+        scheduler.model = kwargs.get("model", MagicMock(spec=[]))
+        if not kwargs.get("has_model_args", False):
+            del scheduler.model.args
+        return scheduler
+
+    def test_tp_distributed_allows_spec_decode(self):
+        """Phase 5: TP mode should NOT disable spec decode anymore."""
+        from vllm_mlx.scheduler import Scheduler
+
+        comm = MagicMock()
+        comm.is_distributed = True
+        runtime = MagicMock()
+        runtime.should_disable.return_value = False
+
+        s = self._make_scheduler_mock(communicator=comm, runtime=runtime)
+        result = Scheduler._can_spec_decode(s)
+        assert result is True
+
+    def test_tp_distributed_with_threshold_still_disables(self):
+        """TP mode with batch size over threshold should still disable."""
+        from vllm_mlx.scheduler import Scheduler
+
+        comm = MagicMock()
+        comm.is_distributed = True
+        runtime = MagicMock()
+        runtime.should_disable.return_value = True
+
+        s = self._make_scheduler_mock(communicator=comm, runtime=runtime)
+        result = Scheduler._can_spec_decode(s)
+        assert result is False
+
+
+# ======================================================================
+# TestWorkerSpecDecodeStep
+# ======================================================================
+
+
+class TestWorkerSpecDecodeStep:
+    """Test the worker spec decode step function with mocks."""
+
+    def test_worker_spec_decode_basic(self):
+        """Test basic worker spec decode step with mocked components."""
+        from vllm_mlx.distributed import SpecDecodePlan, SpecDecodeResult
+        from vllm_mlx.distributed_launcher import _worker_spec_decode_step
+
+        # Create mock components
+        spec_plan = SpecDecodePlan(
+            draft_tokens={"req-1": [10, 20]},
+            max_draft_len=2,
+            batch_order=[("req-1", 0)],
+            batch_y=[5],
+        )
+
+        # Mock batch
+        mock_batch = MagicMock()
+        mock_batch.uids = [100]
+        mock_batch.y = mx.array([5], dtype=mx.int32)
+        mock_batch.tokens = [mx.array([1, 2, 3], dtype=mx.int32)]
+        mock_batch.num_tokens = [0]
+        mock_batch.cache = MagicMock()
+
+        # Mock batch_generator
+        mock_bg = MagicMock()
+        mock_bg.active_batch = mock_batch
+
+        # Mock model that returns dummy logits
+        def mock_model_forward(input_tokens, cache=None):
+            # input shape: (1, 3) -> logits shape: (1, 3, vocab_size)
+            return mx.zeros((input_tokens.shape[0], input_tokens.shape[1], 10))
+
+        mock_model = MagicMock(side_effect=mock_model_forward)
+
+        # Mock communicator that returns a SpecDecodeResult
+        mock_comm = MagicMock()
+        spec_result = SpecDecodeResult(
+            step_id=1,
+            accepted_tokens={"req-1": [10, 20, 99]},  # 2 accepted + bonus
+            trim_amounts=[0],
+            new_y=[99],
+            finished_ids=[],
+        )
+        mock_comm.receive_spec_decode_result.return_value = spec_result
+
+        request_id_to_uid = {"req-1": 100}
+        uid_to_request_id = {100: "req-1"}
+
+        finished = _worker_spec_decode_step(
+            spec_plan=spec_plan,
+            batch_generator=mock_bg,
+            model=mock_model,
+            communicator=mock_comm,
+            request_id_to_uid=request_id_to_uid,
+            uid_to_request_id=uid_to_request_id,
+        )
+
+        # Should have called model forward
+        mock_model.assert_called_once()
+        # Should have received result
+        mock_comm.receive_spec_decode_result.assert_called_once()
+        # No finished IDs
+        assert finished == set()
+
+    def test_worker_spec_decode_no_active_batch(self):
+        """Test worker spec decode when no active batch exists."""
+        from vllm_mlx.distributed import SpecDecodePlan, SpecDecodeResult
+        from vllm_mlx.distributed_launcher import _worker_spec_decode_step
+
+        spec_plan = SpecDecodePlan(
+            draft_tokens={"req-1": [10]},
+            max_draft_len=1,
+            batch_order=[("req-1", 0)],
+            batch_y=[5],
+        )
+
+        mock_bg = MagicMock()
+        mock_bg.active_batch = None
+
+        mock_model = MagicMock()
+        mock_comm = MagicMock()
+        spec_result = SpecDecodeResult(
+            step_id=1,
+            accepted_tokens={},
+            trim_amounts=[],
+            new_y=[],
+            finished_ids=[],
+        )
+        mock_comm.receive_spec_decode_result.return_value = spec_result
+
+        finished = _worker_spec_decode_step(
+            spec_plan=spec_plan,
+            batch_generator=mock_bg,
+            model=mock_model,
+            communicator=mock_comm,
+            request_id_to_uid={},
+            uid_to_request_id={},
+        )
+
+        assert finished == set()
+        # Should still receive result to avoid hang
+        mock_comm.receive_spec_decode_result.assert_called_once()
+
+    def test_worker_spec_decode_with_finished(self):
+        """Test worker spec decode handles finished requests."""
+        from vllm_mlx.distributed import SpecDecodePlan, SpecDecodeResult
+        from vllm_mlx.distributed_launcher import _worker_spec_decode_step
+
+        spec_plan = SpecDecodePlan(
+            draft_tokens={"req-1": [10], "req-2": [20]},
+            max_draft_len=1,
+            batch_order=[("req-1", 0), ("req-2", 1)],
+            batch_y=[5, 6],
+        )
+
+        mock_batch = MagicMock()
+        mock_batch.uids = [100, 200]
+        mock_batch.y = mx.array([5, 6], dtype=mx.int32)
+        mock_batch.tokens = [
+            mx.array([1, 2], dtype=mx.int32),
+            mx.array([3, 4], dtype=mx.int32),
+        ]
+        mock_batch.num_tokens = [0, 0]
+        mock_batch.cache = MagicMock()
+
+        mock_bg = MagicMock()
+        mock_bg.active_batch = mock_batch
+
+        def mock_forward(input_tokens, cache=None):
+            return mx.zeros((input_tokens.shape[0], input_tokens.shape[1], 10))
+
+        mock_model = MagicMock(side_effect=mock_forward)
+
+        spec_result = SpecDecodeResult(
+            step_id=1,
+            accepted_tokens={"req-1": [10, 99], "req-2": [20, 88]},
+            trim_amounts=[0, 0],
+            new_y=[99, 88],
+            finished_ids=["req-2"],
+        )
+        mock_comm = MagicMock()
+        mock_comm.receive_spec_decode_result.return_value = spec_result
+
+        request_id_to_uid = {"req-1": 100, "req-2": 200}
+        uid_to_request_id = {100: "req-1", 200: "req-2"}
+
+        finished = _worker_spec_decode_step(
+            spec_plan=spec_plan,
+            batch_generator=mock_bg,
+            model=mock_model,
+            communicator=mock_comm,
+            request_id_to_uid=request_id_to_uid,
+            uid_to_request_id=uid_to_request_id,
+        )
+
+        assert finished == {"req-2"}

@@ -823,6 +823,122 @@ def test_distributed_launch(num_ranks: int, backend: str) -> None:
 
 
 # ===================================================================
+# Test 7: SpecDecodePlan and SpecDecodeResult serialization
+# ===================================================================
+
+def test_spec_decode_protocol_serialization() -> None:
+    """Verify SpecDecodePlan and SpecDecodeResult pickle round-trip."""
+    print("\n--- Test 7: SpecDecodePlan/SpecDecodeResult serialization ---")
+    from vllm_mlx.distributed import SpecDecodePlan, SpecDecodeResult
+
+    # Test SpecDecodePlan round-trip
+    plan = SpecDecodePlan(
+        draft_tokens={"req-1": [10, 20, 30], "req-2": [40, 50]},
+        max_draft_len=3,
+        batch_order=[("req-1", 0), ("req-2", 1)],
+        batch_y=[100, 200],
+    )
+
+    data = pickle.dumps(plan)
+    restored = pickle.loads(data)
+
+    try:
+        assert restored.draft_tokens == plan.draft_tokens
+        assert restored.max_draft_len == plan.max_draft_len
+        assert restored.batch_order == plan.batch_order
+        assert restored.batch_y == plan.batch_y
+        report("SpecDecodePlan pickle round-trip", True)
+    except AssertionError as e:
+        report("SpecDecodePlan pickle round-trip", False, str(e))
+
+    # Test SpecDecodeResult round-trip
+    result = SpecDecodeResult(
+        step_id=42,
+        accepted_tokens={"req-1": [10, 20, 30, 99], "req-2": [40, 88]},
+        trim_amounts=[2, 3],
+        new_y=[99, 88],
+        finished_ids=["req-2"],
+    )
+
+    data2 = pickle.dumps(result)
+    restored2 = pickle.loads(data2)
+
+    try:
+        assert restored2.step_id == result.step_id
+        assert restored2.accepted_tokens == result.accepted_tokens
+        assert restored2.trim_amounts == result.trim_amounts
+        assert restored2.new_y == result.new_y
+        assert restored2.finished_ids == result.finished_ids
+        report("SpecDecodeResult pickle round-trip", True)
+    except AssertionError as e:
+        report("SpecDecodeResult pickle round-trip", False, str(e))
+
+    # Test StepPlan with spec_decode_plan embedded
+    from vllm_mlx.distributed import StepPlan, InsertOp
+
+    step_plan = StepPlan(
+        step_id=100,
+        inserts=[InsertOp(request_id="req-1", tokens=[1, 2, 3], max_tokens=64)],
+        removes=[],
+        sampling_seeds={"req-1": 12345},
+        fingerprint="test_fp",
+        spec_decode_plan=plan,
+    )
+
+    data3 = pickle.dumps(step_plan)
+    restored3 = pickle.loads(data3)
+
+    try:
+        assert restored3.spec_decode_plan is not None
+        assert restored3.spec_decode_plan.draft_tokens == plan.draft_tokens
+        assert restored3.spec_decode_plan.max_draft_len == plan.max_draft_len
+        assert restored3.spec_decode_plan.batch_order == plan.batch_order
+        assert restored3.spec_decode_plan.batch_y == plan.batch_y
+        report("StepPlan with SpecDecodePlan pickle round-trip", True)
+    except AssertionError as e:
+        report("StepPlan with SpecDecodePlan pickle round-trip", False, str(e))
+
+    # Test StepPlan without spec_decode_plan (backward compat)
+    step_plan_no_spec = StepPlan(
+        step_id=101,
+        inserts=[],
+        removes=[],
+        sampling_seeds={},
+        fingerprint="test_fp2",
+    )
+
+    data4 = pickle.dumps(step_plan_no_spec)
+    restored4 = pickle.loads(data4)
+
+    try:
+        assert restored4.spec_decode_plan is None
+        report("StepPlan without SpecDecodePlan (backward compat)", True)
+    except AssertionError as e:
+        report("StepPlan without SpecDecodePlan (backward compat)", False, str(e))
+
+    # Test Communicator methods exist
+    from vllm_mlx.distributed import MLXCommunicator
+
+    comm = MLXCommunicator()
+
+    try:
+        assert hasattr(comm, "broadcast_spec_decode_result")
+        assert callable(comm.broadcast_spec_decode_result)
+        assert hasattr(comm, "receive_spec_decode_result")
+        assert callable(comm.receive_spec_decode_result)
+        report("MLXCommunicator spec decode methods exist", True)
+    except AssertionError as e:
+        report("MLXCommunicator spec decode methods exist", False, str(e))
+
+    # Test no-op behavior on single process (world_size=1)
+    try:
+        comm.broadcast_spec_decode_result(result)  # should be a no-op
+        report("broadcast_spec_decode_result no-op (single process)", True)
+    except Exception as e:
+        report("broadcast_spec_decode_result no-op (single process)", False, str(e))
+
+
+# ===================================================================
 # Main
 # ===================================================================
 
@@ -893,6 +1009,12 @@ def main() -> int:
         test_memory_cache_tp_keys()
     except Exception as e:
         report("Test 5 (Memory cache TP keys)", False, f"unhandled: {e}")
+        traceback.print_exc()
+
+    try:
+        test_spec_decode_protocol_serialization()
+    except Exception as e:
+        report("Test 7 (Spec decode protocol serialization)", False, f"unhandled: {e}")
         traceback.print_exc()
 
     # Distributed tests (only if --distributed)
