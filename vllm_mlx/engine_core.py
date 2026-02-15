@@ -264,8 +264,16 @@ class EngineCore:
                         # making the server unresponsive to all HTTP requests.
                         await asyncio.sleep(0)
                 else:
-                    # No work, yield control
-                    await asyncio.sleep(step_interval)
+                    # No work to process
+                    if (self.scheduler._communicator is not None
+                            and self.scheduler._communicator.is_distributed):
+                        # In TP mode, we must call step() even when idle to
+                        # broadcast keepalive StepPlans to workers. Without this,
+                        # workers block on receive_step_plan() and JACCL times out.
+                        self.scheduler.step()
+                        await asyncio.sleep(0)
+                    else:
+                        await asyncio.sleep(step_interval)
 
             except asyncio.CancelledError:
                 break
