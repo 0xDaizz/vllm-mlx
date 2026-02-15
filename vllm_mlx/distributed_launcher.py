@@ -400,7 +400,7 @@ def _worker_spec_decode_step(
 
     # 2. Run model forward (TP all_sum happens inside sharded model)
     rank = communicator.rank
-    logger.info(f"[TP-DEBUG] rank{rank} _worker_spec_decode_step: BEFORE model forward, input_tokens.shape={input_tokens.shape}, cache_len={len(batch.cache) if batch.cache else 0}, batch_uids={len(batch.uids)}")
+    logger.info(f"[TP-DEBUG] rank{rank} BEFORE model forward, input_tokens.shape={input_tokens.shape}, batch_uids={len(batch.uids)}")
     logits = model(input_tokens, cache=batch.cache)
     # Eager eval is CRITICAL: completes the TP all_sum synchronization
     # with rank 0 before we wait for SpecDecodeResult.
@@ -416,6 +416,9 @@ def _worker_spec_decode_step(
         from vllm_mlx.spec_decode.cache_utils import batch_variable_trim
         trim_array = mx.array(spec_result.trim_amounts, dtype=mx.int32)
         batch_variable_trim(batch.cache, trim_array)
+        # Materialize trim results before further cache operations
+        if batch.cache:
+            mx.eval(batch.cache[0].offset, batch.cache[0].left_padding)
 
     # 5. Update batch state
     # Set new batch.y
@@ -611,6 +614,10 @@ def worker_loop(
                             batch_generator.remove([uid])
                             del request_id_to_uid[fid]
                             del uid_to_request_id[uid]
+                    # Fix stale _idx after filter and evaluate cache metadata
+                    if finished_spec_ids and batch_generator.active_batch is not None:
+                        from vllm_mlx.spec_decode.cache_utils import fixup_cache_after_filter
+                        fixup_cache_after_filter(batch_generator.active_batch.cache)
                     logger.info(f"[TP-DEBUG] rank{rank} worker_loop: spec_decode_step done, finished={len(finished_spec_ids)}, batch_size={len(request_id_to_uid)}")
                 else:
                     # Normal decode path

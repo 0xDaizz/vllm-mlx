@@ -930,7 +930,7 @@ class Scheduler:
         input_tokens = mx.array(input_rows, dtype=mx.int32)
 
         # Run model forward (TP all_sum happens inside)
-        logger.info(f"[TP-DEBUG] rank0 _step_spec_decode_tp: BEFORE model forward, input_tokens.shape={input_tokens.shape}, cache_len={len(batch.cache) if batch.cache else 0}, batch_size={len(batch_request_ids)}")
+        logger.info(f"[TP-DEBUG] rank0 BEFORE model forward, input_tokens.shape={input_tokens.shape}, batch_size={len(batch_request_ids)}")
         logits = self.model(input_tokens, cache=batch.cache)
         mx.eval(logits)
         logger.info(f"[TP-DEBUG] rank0 _step_spec_decode_tp: AFTER model forward complete, logits.shape={logits.shape}")
@@ -1033,6 +1033,9 @@ class Scheduler:
         if any(t > 0 for t in trim_amounts):
             trim_array = mx.array(trim_amounts, dtype=mx.int32)
             batch_variable_trim(batch.cache, trim_array)
+            # Materialize trim results before further cache operations
+            if batch.cache:
+                mx.eval(batch.cache[0].offset, batch.cache[0].left_padding)
 
         # Update batch state (new_y, logprobs, tokens, num_tokens)
         new_y = []
@@ -2349,6 +2352,10 @@ class Scheduler:
                 # bypasses BatchGenerator.next() internal removal)
                 if self.batch_generator is not None:
                     self.batch_generator.remove([uid])
+                    # Fix stale _idx after filter and evaluate cache metadata
+                    if self.batch_generator.active_batch is not None:
+                        from vllm_mlx.spec_decode.cache_utils import fixup_cache_after_filter
+                        fixup_cache_after_filter(self.batch_generator.active_batch.cache)
 
             # Clean up spec decode state
             if self._spec_decode_runtime is not None:

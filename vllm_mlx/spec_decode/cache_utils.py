@@ -120,3 +120,75 @@ def _layer_supports_per_seq_trim(layer: Any) -> bool:
         if isinstance(caches, (tuple, list)):
             return all(_layer_supports_per_seq_trim(c) for c in caches)
     return hasattr(layer, "trim_per_sequence")
+
+
+def fixup_cache_after_filter(cache_layers: List[Any]) -> None:
+    """Recompute _idx for all cache layers after batch.filter().
+
+    BatchKVCache.filter() does not recompute _idx to reflect the
+    new max(offset + left_padding).  If the removed entry held the
+    maximum position, _idx stays stale, causing the model to read
+    garbage KV positions on subsequent forward passes.
+
+    Also evaluates cache metadata to prevent lazy graph accumulation.
+
+    Args:
+        cache_layers: List of BatchKVCache (or CacheList) instances.
+    """
+    if not cache_layers:
+        return
+    for layer in cache_layers:
+        _fixup_layer_idx(layer)
+    # Materialize all metadata so the next forward starts clean
+    _eval_cache_metadata(cache_layers)
+
+
+def _fixup_layer_idx(layer: Any) -> None:
+    """Recompute _idx for a single cache layer (recurse into CacheList)."""
+    try:
+        from mlx_lm.models.cache import CacheList
+        if isinstance(layer, CacheList):
+            for sub in layer.caches:
+                _fixup_layer_idx(sub)
+            return
+    except ImportError:
+        caches = getattr(layer, "caches", None)
+        if isinstance(caches, (tuple, list)):
+            for sub in caches:
+                _fixup_layer_idx(sub)
+            return
+    # Recompute _idx
+    if hasattr(layer, "offset") and hasattr(layer, "left_padding") and hasattr(layer, "_idx"):
+        new_idx = int(mx.max(layer.left_padding + layer.offset).item())
+        if new_idx != layer._idx:
+            logger.debug(f"fixup_cache_after_filter: _idx {layer._idx} -> {new_idx}")
+            layer._idx = new_idx
+
+
+def _eval_cache_metadata(cache_layers: List[Any]) -> None:
+    """Force-evaluate cache offset and left_padding to prevent lazy accumulation."""
+    tensors = []
+    for layer in cache_layers:
+        _collect_cache_metadata(layer, tensors)
+    if tensors:
+        mx.eval(*tensors)
+
+
+def _collect_cache_metadata(layer: Any, tensors: list) -> None:
+    """Collect offset/left_padding tensors from a cache layer."""
+    try:
+        from mlx_lm.models.cache import CacheList
+        if isinstance(layer, CacheList):
+            for sub in layer.caches:
+                _collect_cache_metadata(sub, tensors)
+            return
+    except ImportError:
+        caches = getattr(layer, "caches", None)
+        if isinstance(caches, (tuple, list)):
+            for sub in caches:
+                _collect_cache_metadata(sub, tensors)
+            return
+    if hasattr(layer, "offset"):
+        tensors.append(layer.offset)
+    if hasattr(layer, "left_padding"):
+        tensors.append(layer.left_padding)
