@@ -400,13 +400,16 @@ def _worker_spec_decode_step(
 
     # 2. Run model forward (TP all_sum happens inside sharded model)
     rank = communicator.rank
+    logger.info(f"[TP-DEBUG] rank{rank} BEFORE model forward, input_tokens.shape={input_tokens.shape}, batch_uids={len(batch.uids)}")
     logits = model(input_tokens, cache=batch.cache)
     # Eager eval is CRITICAL: completes the TP all_sum synchronization
     # with rank 0 before we wait for SpecDecodeResult.
     mx.eval(logits)
+    logger.info(f"[TP-DEBUG] rank{rank} _worker_spec_decode_step: AFTER model forward complete, logits.shape={logits.shape}")
 
     # 3. Receive SpecDecodeResult from rank 0
     spec_result = communicator.receive_spec_decode_result()
+    logger.info(f"[TP-DEBUG] rank{rank} _worker_spec_decode_step: received spec_result, finished_ids={spec_result.finished_ids}")
 
     # 4. Apply KV cache trim
     if spec_result.trim_amounts and any(t > 0 for t in spec_result.trim_amounts):
@@ -451,17 +454,6 @@ def _worker_spec_decode_step(
 
     # Materialize all updated tensors to prevent lazy graph accumulation
     mx.eval(batch.y, *batch.tokens)
-
-    # Materialize cache tensors to prevent lazy graph accumulation.
-    # trim_per_sequence and filter create lazy chains on offset,
-    # left_padding, keys, and values. Without explicit eval, these
-    # chains grow with every step and eventually cause Metal/RDMA
-    # hangs when the graph becomes too deep.
-    if batch.cache:
-        cache_tensors = []
-        for c in batch.cache:
-            cache_tensors.extend([c.keys, c.values, c.offset, c.left_padding])
-        mx.eval(*cache_tensors)
 
     # 6. Return finished IDs for removal
     return set(spec_result.finished_ids)
@@ -531,6 +523,13 @@ def worker_loop(
 
     logger.info(f"[Rank {rank}] BatchGenerator created, entering StepPlan loop")
 
+    # Ready barrier: wait for rank 0 to finish server initialization.
+    # Rank 0 loads the draft model, starts uvicorn, and creates the engine
+    # loop before signaling readiness. Without this wait, we'd call
+    # receive_step_plan() while rank 0 isn't broadcasting, causing JACCL timeout.
+    communicator.barrier()
+    logger.info(f"[Rank {rank}] Ready barrier passed — rank 0 scheduler loop starting")
+
     # Shutdown handling
     shutdown_event = threading.Event()
 
@@ -547,6 +546,7 @@ def worker_loop(
         # Step 3: StepPlan processing loop
         while not shutdown_event.is_set():
             try:
+                logger.info(f"[TP-DEBUG] rank{rank} worker_loop: waiting for StepPlan, batch_size={len(request_id_to_uid)}")
                 # Receive StepPlan from rank 0
                 plan = communicator.receive_step_plan()
 
@@ -556,12 +556,16 @@ def worker_loop(
                     break
 
                 # Apply removes first
+                removes_processed = 0
                 for request_id in plan.removes:
                     if request_id in request_id_to_uid:
                         uid = request_id_to_uid[request_id]
                         batch_generator.remove([uid])
                         del request_id_to_uid[request_id]
                         del uid_to_request_id[uid]
+                        removes_processed += 1
+                if removes_processed > 0:
+                    logger.info(f"[TP-DEBUG] rank{rank} worker_loop: processed {removes_processed} removes, batch_size={len(request_id_to_uid)}")
 
                 # Apply inserts
                 for insert_op in plan.inserts:
@@ -621,6 +625,7 @@ def worker_loop(
                     if finished_spec_ids and batch_generator.active_batch is not None:
                         from vllm_mlx.spec_decode.cache_utils import fixup_cache_after_filter
                         fixup_cache_after_filter(batch_generator.active_batch.cache)
+                    logger.info(f"[TP-DEBUG] rank{rank} worker_loop: spec_decode_step done, finished={len(finished_spec_ids)}, batch_size={len(request_id_to_uid)}")
                 else:
                     # Normal decode path
                     # Execute forward pass (model computation with all_sum).

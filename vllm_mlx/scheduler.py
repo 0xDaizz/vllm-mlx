@@ -930,8 +930,10 @@ class Scheduler:
         input_tokens = mx.array(input_rows, dtype=mx.int32)
 
         # Run model forward (TP all_sum happens inside)
+        logger.info(f"[TP-DEBUG] rank0 BEFORE model forward, input_tokens.shape={input_tokens.shape}, batch_size={len(batch_request_ids)}")
         logits = self.model(input_tokens, cache=batch.cache)
         mx.eval(logits)
+        logger.info(f"[TP-DEBUG] rank0 _step_spec_decode_tp: AFTER model forward complete, logits.shape={logits.shape}")
 
         # Build VerifyResult
         verify_result = VerifyResult()
@@ -1087,17 +1089,6 @@ class Scheduler:
                 batch.num_tokens[batch_idx] += n_committed
 
         mx.eval(batch.y, *batch.tokens)
-
-        # Materialize cache tensors to prevent lazy graph accumulation.
-        # trim_per_sequence and filter create lazy chains on offset,
-        # left_padding, keys, and values. Without explicit eval, these
-        # chains grow with every step and eventually cause Metal/RDMA
-        # hangs when the graph becomes too deep.
-        if batch.cache:
-            cache_tensors = []
-            for c in batch.cache:
-                cache_tensors.extend([c.keys, c.values, c.offset, c.left_padding])
-            mx.eval(*cache_tensors)
 
         # Broadcast SpecDecodeResult to workers
         if self._communicator is not None and self._communicator.is_distributed:
@@ -2559,6 +2550,7 @@ class Scheduler:
                 spec_pending_state = None
                 if self.batch_generator is not None and self.running and self._can_spec_decode():
                     spec_plan, spec_pending_state = self._build_spec_decode_plan()
+                    logger.info(f"[TP-DEBUG] step(): spec_plan built, batch_size={len(self.running)}, spec_plan={'YES' if spec_plan else 'NO'}")
 
                 # TP: Broadcast StepPlan BEFORE batch_generator.next()
                 # Workers need inserts/removes before running the forward pass
@@ -2575,7 +2567,9 @@ class Scheduler:
                     if spec_plan is not None and spec_pending_state is not None:
                         # TP-aware spec decode path
                         try:
+                            logger.info(f"[TP-DEBUG] step(): ENTERING _step_spec_decode_tp, running={len(self.running)}")
                             spec_responses = self._step_spec_decode_tp(spec_pending_state)
+                            logger.info(f"[TP-DEBUG] step(): _step_spec_decode_tp RETURNED, responses={len(spec_responses) if spec_responses else 'None'}")
                         except Exception as spec_err:
                             # CRITICAL: Workers are waiting for SpecDecodeResult.
                             # Send a no-op result so they don't deadlock.
@@ -2614,6 +2608,7 @@ class Scheduler:
                                 output.outputs = outputs
                                 output.finished_request_ids = finished_ids
                                 self._cleanup_finished(finished_ids)
+                                logger.info(f"[TP-DEBUG] step(): cleanup done, finished={len(finished_ids)}, remaining={len(self.running)}")
                         else:
                             # Spec decode returned None or failed -- fall back to normal decode.
                             # NOTE: In TP mode, workers already ran model forward in spec decode

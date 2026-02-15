@@ -186,6 +186,16 @@ class EngineCore:
         _memory_pressure_threshold = 500 * 1024 * 1024 * 1024
         _memory_check_interval = 64
 
+        # Ready barrier: signal to workers that rank 0's scheduler loop is about to begin.
+        # Without this, workers enter receive_step_plan() while rank 0 is still
+        # initializing (loading draft model, starting uvicorn), causing JACCL timeout.
+        if self._communicator is not None and self._communicator.is_distributed:
+            import mlx.core as mx
+            self._communicator.barrier()
+            logger.info(
+                f"Engine ready barrier passed — workers can now receive StepPlans"
+            )
+
         while self._running:
             try:
                 if self.scheduler.has_requests():
