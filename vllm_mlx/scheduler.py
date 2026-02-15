@@ -2360,8 +2360,12 @@ class Scheduler:
         """Broadcast sampled token IDs from rank 0 to all ranks.
 
         After batch_generator.next(), rank 0 has the authoritative
-        sampled tokens. Broadcast them so all ranks can advance
-        their KV caches consistently.
+        sampled tokens in batch.y. Broadcast them so all ranks can
+        advance their KV caches consistently.
+
+        Note: response.token contains the OLD batch.y (the token used
+        as input in the current step), NOT the newly sampled token.
+        We must broadcast batch.y which holds the actual new token.
 
         Args:
             responses: List of BatchGenerator.Response objects from next()
@@ -2374,18 +2378,30 @@ class Scheduler:
             self._communicator.broadcast_int(0, src=0)
             return
 
+        # Use batch.y (newly sampled token) instead of response.token (old input)
+        batch = self.batch_generator.active_batch
+        if batch is not None:
+            mx.eval(batch.y)  # Ensure async computation is complete
+            token_ids = batch.y
+        else:
+            # Fallback: should not happen in normal operation
+            token_ids = mx.array([r.token for r in responses], dtype=mx.int32)
+
         # Broadcast token count first for size validation
-        token_ids = mx.array([r.token for r in responses], dtype=mx.int32)
-        self._communicator.broadcast_int(len(responses), src=0)
+        # Use token_ids.shape[0] (from batch.y) instead of len(responses),
+        # because requests can finish mid-step making them differ.
+        self._communicator.broadcast_int(token_ids.shape[0], src=0)
 
         # Broadcast token array
         token_ids = self._communicator.broadcast_tokens(token_ids, src=0)
         mx.eval(token_ids)
 
-        # Update responses with the broadcast tokens on non-rank-0 workers
-        token_list = token_ids.tolist()
-        for i, response in enumerate(responses):
-            response.token = token_list[i]
+        # NOTE: We intentionally do NOT mutate response.token here.
+        # This method only runs on Rank 0 (workers receive tokens in the
+        # worker loop in distributed_launcher.py). The token_ids come from
+        # batch.y (the NEXT step's token), not from response.token (the
+        # current step's token), so overwriting would corrupt Rank 0's
+        # token stream sent to the user.
 
     def _build_step_plan(self, scheduled: list, finished_ids: set, token_ids: dict | None = None, spec_decode_plan=None) -> "StepPlan":
         """Build a StepPlan from the current scheduling state.

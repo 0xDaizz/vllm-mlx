@@ -44,6 +44,9 @@ _SUPPORTED_BACKENDS = ("jaccl", "ring", "any")
 
 _JACCL_DEFAULT_ENVS = ["MLX_METAL_FAST_SYNCH=1"]
 
+# Pre-loaded model/tokenizer for distributed mode (set in distributed_main)
+_preloaded_model: tuple | None = None
+
 
 # ---------------------------------------------------------------------------
 # Hostfile generation
@@ -459,6 +462,8 @@ def _worker_spec_decode_step(
 def worker_loop(
     communicator: Any,
     model_name: str,
+    model: Any = None,
+    tokenizer: Any = None,
     tokenizer_config: dict | None = None,
 ) -> None:
     """Worker loop for non-rank-0 processes.
@@ -484,13 +489,17 @@ def worker_loop(
     logger.info(f"[Rank {rank}] Worker starting (world_size={world_size})")
 
     # Step 1: Load sharded model
-    logger.info(f"[Rank {rank}] Loading sharded model: {model_name}")
-    model, tokenizer = sharded_load(
-        model_name,
-        pipeline_group=None,
-        tensor_group=communicator.group,
-    )
-    communicator.barrier()
+    if model is not None and tokenizer is not None:
+        logger.info(f"[Rank {rank}] Using pre-loaded model")
+    else:
+        # Legacy path: load model here (for non-distributed_main callers)
+        logger.info(f"[Rank {rank}] Loading sharded model: {model_name}")
+        model, tokenizer = sharded_load(
+            model_name,
+            pipeline_group=None,
+            tensor_group=communicator.group,
+        )
+        communicator.barrier()
     logger.info(f"[Rank {rank}] Model loaded successfully")
 
     # Step 2: Create BatchGenerator with sharded model
@@ -582,7 +591,6 @@ def worker_loop(
                             f"local_requests={len(local_running_ids)}, "
                             f"batch_size={local_batch_size}"
                         )
-
                 # Check if this step is a speculative decoding step
                 if plan.spec_decode_plan is not None:
                     # Spec decode path: build input tensor + model forward + receive result
@@ -607,6 +615,14 @@ def worker_loop(
                     # This must happen on all ranks simultaneously.
                     if request_id_to_uid:  # Only if there are active requests
                         _responses = batch_generator.next()
+
+                        # Force async computation to complete before the
+                        # broadcast overwrites batch.y.  batch_generator.next()
+                        # calls mx.async_eval(batch.y, ...) internally; without
+                        # this explicit eval, the broadcast below may overwrite
+                        # batch.y before the async computation finishes.
+                        if batch_generator.active_batch is not None:
+                            mx.eval(batch_generator.active_batch.y)
 
                     # Receive broadcast token IDs from rank 0.
                     # Protocol: rank 0 sends broadcast_int(count) then
@@ -715,23 +731,60 @@ def distributed_main(server_args: list[str] | None = None) -> None:
 
     communicator = MLXCommunicator(group=group)
 
+    # Store as global singleton so get_communicator() reuses it
+    # instead of calling mx.distributed.init() again (which crashes).
+    import vllm_mlx.distributed as _dist_mod
+    _dist_mod._global_communicator = communicator
+
+    # --- Set distributed environment vars BEFORE any collective ops ---
+    os.environ["VLLM_MLX_DISTRIBUTED"] = "1"
+    os.environ["VLLM_MLX_WORLD_SIZE"] = str(world_size)
+    os.environ["VLLM_MLX_BACKEND"] = backend
+
+    # --- Shared model loading (ALL ranks, collective operation) ---
+    # Extract model name from server_args or environment
+    model_name = os.environ.get("VLLM_MLX_MODEL", "")
+    if not model_name and server_args:
+        for i, arg in enumerate(server_args):
+            if arg == "--model" and i + 1 < len(server_args):
+                model_name = server_args[i + 1]
+                break
+
+    if not model_name:
+        logger.error(f"[Rank {rank}] No model name provided")
+        return
+
+    # Set env for other components
+    os.environ["VLLM_MLX_MODEL"] = model_name
+
+    # ALL ranks: load model with sharded_load (collective operation).
+    # This MUST be called on all ranks simultaneously because it uses
+    # all_sum internally for weight distribution.
+    logger.info(f"[Rank {rank}] Loading sharded model: {model_name}")
+    from mlx_lm.utils import sharded_load
+
+    model, tokenizer = sharded_load(
+        model_name,
+        pipeline_group=None,
+        tensor_group=communicator.group,
+    )
+    logger.info(f"[Rank {rank}] Sharded model loaded successfully")
+
+    # ALL ranks: synchronize after model loading
+    communicator.barrier()
+    logger.info(f"[Rank {rank}] Post-load barrier passed")
+
     if rank == 0:
+        # Store pre-loaded model globally for server's BatchedEngine to pick up.
+        # Must store on BOTH __main__ (this process) and the package module
+        # (which batched.py imports from) since python -m loads as __main__.
+        global _preloaded_model
+        _preloaded_model = (model, tokenizer)
+        import vllm_mlx.distributed_launcher as _launcher_mod
+        _launcher_mod._preloaded_model = (model, tokenizer)
         _run_rank0_server(communicator, server_args)
     else:
-        # Get model name from environment or server args
-        model_name = os.environ.get("VLLM_MLX_MODEL", "")
-        if not model_name and server_args:
-            # Try to parse --model from server args
-            for i, arg in enumerate(server_args):
-                if arg == "--model" and i + 1 < len(server_args):
-                    model_name = server_args[i + 1]
-                    break
-
-        if not model_name:
-            logger.error(f"[Rank {rank}] No model name provided")
-            return
-
-        worker_loop(communicator, model_name=model_name)
+        worker_loop(communicator, model_name=model_name, model=model, tokenizer=tokenizer)
 
 
 def _run_rank0_server(
@@ -751,24 +804,6 @@ def _run_rank0_server(
         f"[Rank 0] Starting API server "
         f"(world_size={communicator.world_size})"
     )
-
-    # Store the communicator so the server/engine can access it.
-    # This uses an environment marker that the server can check.
-    os.environ["VLLM_MLX_DISTRIBUTED"] = "1"
-    os.environ["VLLM_MLX_WORLD_SIZE"] = str(communicator.world_size)
-    os.environ["VLLM_MLX_BACKEND"] = os.environ.get("MLX_DISTRIBUTED_BACKEND", "any")
-
-    # Export model name so worker ranks can access it
-    if server_args:
-        for i, arg in enumerate(server_args):
-            if arg == "--model" and i + 1 < len(server_args):
-                os.environ["VLLM_MLX_MODEL"] = server_args[i + 1]
-                break
-
-    # Initial barrier: synchronize with all worker ranks before
-    # starting the server.  Workers also call barrier() once.
-    communicator.barrier()
-    logger.info("[Rank 0] Initial barrier passed, starting server")
 
     # Phase 0: Just start the server normally.
     # Phase 2 will integrate the communicator with EngineCore/Scheduler
