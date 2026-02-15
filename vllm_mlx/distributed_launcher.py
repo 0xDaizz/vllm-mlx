@@ -114,9 +114,9 @@ def generate_jaccl_hostfile(
             "backend": "jaccl",
             "envs": ["MLX_METAL_FAST_SYNCH=1"],
             "hosts": [
-                {"ssh": "host1", "ips": ["192.168.1.1"],
+                {"ssh": "host1", "ips": ["10.254.0.1"],
                  "rdma": [null, "rdma_en2"]},
-                {"ssh": "host2", "ips": ["192.168.1.2"],
+                {"ssh": "host2", "ips": ["10.254.0.2"],
                  "rdma": ["rdma_en2", null]}
             ]
         }
@@ -840,7 +840,7 @@ Examples:
 
   # Launch with explicit hosts
   python -m vllm_mlx.distributed_launcher \\
-      --hosts 192.168.1.1 192.168.1.2 --backend ring -- \\
+      --hosts 10.254.0.1 10.254.0.2 --backend ring -- \\
       --model mlx-community/Llama-3.2-3B-Instruct-4bit
 """,
     )
