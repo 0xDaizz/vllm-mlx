@@ -399,13 +399,17 @@ def _worker_spec_decode_step(
     input_tokens = mx.array(input_rows, dtype=mx.int32)  # (B_spec, max_k+1)
 
     # 2. Run model forward (TP all_sum happens inside sharded model)
+    rank = communicator.rank
+    logger.info(f"[TP-DEBUG] rank{rank} _worker_spec_decode_step: BEFORE model forward, input_tokens.shape={input_tokens.shape}, cache_len={len(batch.cache) if batch.cache else 0}, batch_uids={len(batch.uids)}")
     logits = model(input_tokens, cache=batch.cache)
     # Eager eval is CRITICAL: completes the TP all_sum synchronization
     # with rank 0 before we wait for SpecDecodeResult.
     mx.eval(logits)
+    logger.info(f"[TP-DEBUG] rank{rank} _worker_spec_decode_step: AFTER model forward complete, logits.shape={logits.shape}")
 
     # 3. Receive SpecDecodeResult from rank 0
     spec_result = communicator.receive_spec_decode_result()
+    logger.info(f"[TP-DEBUG] rank{rank} _worker_spec_decode_step: received spec_result, finished_ids={spec_result.finished_ids}")
 
     # 4. Apply KV cache trim
     if spec_result.trim_amounts and any(t > 0 for t in spec_result.trim_amounts):
@@ -532,6 +536,7 @@ def worker_loop(
         # Step 3: StepPlan processing loop
         while not shutdown_event.is_set():
             try:
+                logger.info(f"[TP-DEBUG] rank{rank} worker_loop: waiting for StepPlan, batch_size={len(request_id_to_uid)}")
                 # Receive StepPlan from rank 0
                 plan = communicator.receive_step_plan()
 
@@ -541,12 +546,16 @@ def worker_loop(
                     break
 
                 # Apply removes first
+                removes_processed = 0
                 for request_id in plan.removes:
                     if request_id in request_id_to_uid:
                         uid = request_id_to_uid[request_id]
                         batch_generator.remove([uid])
                         del request_id_to_uid[request_id]
                         del uid_to_request_id[uid]
+                        removes_processed += 1
+                if removes_processed > 0:
+                    logger.info(f"[TP-DEBUG] rank{rank} worker_loop: processed {removes_processed} removes, batch_size={len(request_id_to_uid)}")
 
                 # Apply inserts
                 for insert_op in plan.inserts:
@@ -602,6 +611,7 @@ def worker_loop(
                             batch_generator.remove([uid])
                             del request_id_to_uid[fid]
                             del uid_to_request_id[uid]
+                    logger.info(f"[TP-DEBUG] rank{rank} worker_loop: spec_decode_step done, finished={len(finished_spec_ids)}, batch_size={len(request_id_to_uid)}")
                 else:
                     # Normal decode path
                     # Execute forward pass (model computation with all_sum).
