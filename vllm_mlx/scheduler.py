@@ -812,6 +812,7 @@ class Scheduler:
         k = runtime.config.num_speculative_tokens
 
         # 1. Build request states (same as _step_spec_decode steps 1-2)
+        batch_y_list = batch.y.tolist()
         request_states = {}
         uid_to_request_id_local = {}
         for i, uid in enumerate(batch.uids):
@@ -823,7 +824,7 @@ class Scheduler:
                 continue
             token_ids = list(request.prompt_token_ids or []) + list(
                 request.output_token_ids
-            )
+            ) + [batch_y_list[i]]
             request_states[request_id] = RequestState(
                 request_id=request_id,
                 token_ids=token_ids,
@@ -1122,6 +1123,7 @@ class Scheduler:
         k = runtime.config.num_speculative_tokens
 
         # 1. Build request states
+        batch_y_list = batch.y.tolist()
         request_states = {}
         uid_to_request_id_local = {}
         for i, uid in enumerate(batch.uids):
@@ -1131,10 +1133,9 @@ class Scheduler:
             request = self.running.get(request_id)
             if request is None:
                 continue
-            # Token sequence = prompt + output tokens generated so far
             token_ids = list(request.prompt_token_ids or []) + list(
                 request.output_token_ids
-            )
+            ) + [batch_y_list[i]]
             request_states[request_id] = RequestState(
                 request_id=request_id,
                 token_ids=token_ids,

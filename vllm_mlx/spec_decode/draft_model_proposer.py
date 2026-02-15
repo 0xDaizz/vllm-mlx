@@ -101,7 +101,8 @@ class DraftModelProposer(BaseProposer):
                 f"Loading draft model: {self._config.draft_model_name}"
             )
             self._model, self._tokenizer = mlx_lm.load(
-                self._config.draft_model_name
+                self._config.draft_model_name,
+                tokenizer_config={"trust_remote_code": True},
             )
             logger.info(
                 f"Draft model loaded successfully: {self._config.draft_model_name}"
