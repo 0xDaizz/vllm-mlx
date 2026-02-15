@@ -221,12 +221,12 @@ The generated hostfile (`~/mlx_hostfile.json`) will look like this:
   "hosts": [
     {
       "ssh": "machine-a",
-      "ips": ["192.168.XX.1"],
+      "ips": ["10.254.0.1"],
       "rdma": [null, "rdma_en2"]
     },
     {
       "ssh": "machine-b",
-      "ips": ["192.168.XX.2"],
+      "ips": ["10.254.0.2"],
       "rdma": ["rdma_en2", null]
     }
   ]
@@ -244,6 +244,32 @@ Key fields:
 | `hosts[].rdma` | RDMA device mapping -- `null` for self, device name for each peer |
 
 The `rdma` array has one entry per host. Entry `i` in host `j`'s `rdma` array is the RDMA device on host `j` that connects to host `i`. A `null` entry means "self" (no RDMA device needed for local communication).
+
+> **WARNING: Avoid common subnets for TB5 RDMA interfaces.**
+>
+> Thunderbolt 5 point-to-point links need static IP addresses. Do NOT use
+> `192.168.0.x` or `192.168.1.x` — these conflict with most home/office Wi-Fi
+> routers (default gateway `192.168.0.1` or `192.168.1.1`). When a TB5
+> interface shares a subnet with the default gateway, the OS routes internet
+> traffic over the TB5 cable instead of Wi-Fi, breaking internet connectivity
+> and Tailscale on the receiving machine.
+>
+> **Recommended subnets** for TB5 RDMA (point-to-point, /30):
+> - `10.254.0.0/30` → machine-a: `10.254.0.1`, machine-b: `10.254.0.2`
+> - `172.30.0.0/30` → alternative if 10.x is already in use
+>
+> To configure on macOS:
+> ```bash
+> # On machine-a (find the TB5 interface with `ifconfig | grep -B2 rdma`)
+> sudo ifconfig en3 inet 10.254.0.1 netmask 255.255.255.252
+>
+> # On machine-b
+> sudo ifconfig en3 inet 10.254.0.2 netmask 255.255.255.252
+> ```
+>
+> **Note:** These settings are lost on reboot. To persist, configure them in
+> System Settings → Network → Thunderbolt Bridge, or add the commands to a
+> login script.
 
 ---
 
@@ -553,6 +579,30 @@ The ~7% distributed overhead means you retain ~93% of the theoretical 2x speedup
 **Symptom:** Intermittent connectivity or RDMA device not detected.
 
 **Fix:** On Mac Studio, avoid using the Thunderbolt port immediately adjacent to the Ethernet port. Use one of the other Thunderbolt ports for the inter-machine cable. Once a working port is found, use it consistently.
+
+### TB5 IP Conflict with Router
+
+**Symptom:** One machine loses internet connectivity or Tailscale goes offline
+after configuring TB5 RDMA.
+
+**Cause:** The TB5 interface IP (e.g., `192.168.0.1/30`) conflicts with the
+Wi-Fi router's gateway IP (`192.168.0.1`). The OS resolves ARP for the gateway
+to the TB5 interface MAC instead of the router.
+
+**Fix:**
+```bash
+# Remove conflicting IP
+sudo ifconfig en3 inet 192.168.0.1 delete
+
+# Set non-conflicting IP
+sudo ifconfig en3 inet 10.254.0.1 netmask 255.255.255.252
+
+# Flush ARP cache
+sudo arp -d -a
+
+# Verify gateway is reachable
+ping -c 1 192.168.0.1  # should get router response
+```
 
 ### Model Loading Fails on One Rank
 
