@@ -251,13 +251,21 @@ def add_reasoning_args(parser: argparse.ArgumentParser) -> None:
     """Add reasoning-parser arguments (choices loaded dynamically)."""
     from .reasoning import list_parsers
 
+    parser.add_argument(
+        "--enable-thinking",
+        action="store_true",
+        default=False,
+        help="Enable thinking/reasoning mode. The model generates <think>...</think> "
+             "reasoning before its response. A reasoning parser is auto-activated "
+             "to separate thinking from content in the API response.",
+    )
     reasoning_choices = list_parsers()
     parser.add_argument(
         "--reasoning-parser",
         type=str,
         default=None,
         choices=reasoning_choices if reasoning_choices else None,
-        help="Reasoning parser for extracting thinking tokens",
+        help="Explicit reasoning parser (implies --enable-thinking)",
     )
 
 
@@ -499,6 +507,7 @@ def rebuild_server_args_from_namespace(args) -> list[str]:
         "kv_cache_quantization": "--kv-cache-quantization",
         "use_paged_cache": "--use-paged-cache",
         "enable_auto_tool_choice": "--enable-auto-tool-choice",
+        "enable_thinking": "--enable-thinking",
     }
     for attr, flag in _BOOL_FLAGS.items():
         if getattr(args, attr, False):

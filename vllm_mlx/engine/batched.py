@@ -254,10 +254,30 @@ class BatchedEngine(BaseEngine):
         if "qwen3" in self._model_name.lower() or "Qwen3" in self._model_name:
             tokenizer_config["eos_token"] = "<|im_end|>"
 
-        self._model, self._tokenizer = load_model_with_fallback(
-            self._model_name,
-            tokenizer_config=tokenizer_config,
-        )
+        # Load model: check for pre-loaded distributed model first
+        import os
+
+        _preloaded = None
+        if os.environ.get("VLLM_MLX_DISTRIBUTED") == "1":
+            world_size = int(os.environ.get("VLLM_MLX_WORLD_SIZE", "1"))
+            if world_size > 1:
+                try:
+                    from ..distributed_launcher import _preloaded_model
+
+                    _preloaded = _preloaded_model
+                except ImportError:
+                    pass
+
+        if _preloaded is not None:
+            self._model, self._tokenizer = _preloaded
+            logger.info(
+                "Using pre-loaded sharded model for distributed mode"
+            )
+        else:
+            self._model, self._tokenizer = load_model_with_fallback(
+                self._model_name,
+                tokenizer_config=tokenizer_config,
+            )
 
         # Set Metal memory limits to make allocation failures graceful
         # instead of fatal Metal command buffer errors (SIGABRT)
@@ -357,15 +377,26 @@ class BatchedEngine(BaseEngine):
             }
             if tools:
                 template_kwargs["tools"] = tools
+            # Enable thinking mode for reasoning models (matches simple.py logic).
+            # Disabled for coder models where thinking tags interfere with tool parsing.
+            # Only set for non-MLLM models; MLLM processors may not support it.
+            if not self._is_mllm:
+                # Thinking mode is controlled by the server's --reasoning-parser
+                # or auto-detection. When thinking is enabled, a parser is active
+                # to separate <think>...</think> from the response content.
+                import os
+                enable_thinking = os.environ.get("VLLM_MLX_ENABLE_THINKING", "") == "1"
+                template_kwargs["enable_thinking"] = enable_thinking
 
             try:
                 return template_applicator.apply_chat_template(
                     messages, **template_kwargs
                 )
             except TypeError as e:
-                # Some templates don't accept 'tools'; retry without them.
+                # Some templates don't accept 'tools' or 'enable_thinking';
+                # retry without them.
                 logger.debug(f"Chat template TypeError, retrying without extras: {e}")
-                for key in ["tools"]:
+                for key in ["tools", "enable_thinking"]:
                     if key in template_kwargs:
                         del template_kwargs[key]
                 return template_applicator.apply_chat_template(

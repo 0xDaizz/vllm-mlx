@@ -81,14 +81,36 @@ def serve_command(args):
     if args.default_top_p is not None:
         server._default_top_p = args.default_top_p
 
-    # Configure reasoning parser
-    if args.reasoning_parser:
+    # Configure thinking mode and reasoning parser
+    # --enable-thinking: model generates <think>...</think> before responding.
+    # --reasoning-parser: explicit parser choice (implies --enable-thinking).
+    enable_thinking = getattr(args, 'enable_thinking', False) or bool(args.reasoning_parser)
+
+    if enable_thinking and not args.reasoning_parser:
+        # Auto-detect parser from model name
+        _thinking_model_map = {
+            "kimi": "kimi",
+            "qwen3": "qwen3",
+            "deepseek-r1": "deepseek_r1",
+            "deepseek_r1": "deepseek_r1",
+        }
+        model_lower = args.model.lower()
+        for pattern, parser_name in _thinking_model_map.items():
+            if pattern in model_lower:
+                args.reasoning_parser = parser_name
+                break
+        if not args.reasoning_parser:
+            # Fallback: use deepseek_r1 parser (generic <think> tag handler)
+            args.reasoning_parser = "deepseek_r1"
+        logger.info(f"Thinking mode enabled, parser: {args.reasoning_parser}")
+
+    if enable_thinking and args.reasoning_parser:
         try:
             from .reasoning import get_parser
 
             parser_cls = get_parser(args.reasoning_parser)
             server._reasoning_parser = parser_cls()
-            logger.info(f"Reasoning parser enabled: {args.reasoning_parser}")
+            logger.info(f"Reasoning parser activated: {args.reasoning_parser}")
         except KeyError as e:
             print(f"Error: {e}")
             sys.exit(1)
@@ -103,6 +125,13 @@ def serve_command(args):
             sys.exit(1)
     else:
         server._reasoning_parser = None
+
+    # Export flag for engine
+    if enable_thinking:
+        os.environ["VLLM_MLX_ENABLE_THINKING"] = "1"
+    else:
+        os.environ.pop("VLLM_MLX_ENABLE_THINKING", None)
+    os.environ.pop("VLLM_MLX_REASONING_PARSER", None)  # No longer needed
 
     # Security summary at startup
     print("=" * 60)
@@ -121,10 +150,10 @@ def serve_command(args):
         print(f"  Tool calling: ENABLED (parser: {args.tool_call_parser})")
     else:
         print("  Tool calling: Use --enable-auto-tool-choice to enable")
-    if args.reasoning_parser:
-        print(f"  Reasoning: ENABLED (parser: {args.reasoning_parser})")
+    if enable_thinking:
+        print(f"  Thinking: ENABLED (parser: {args.reasoning_parser})")
     else:
-        print("  Reasoning: Use --reasoning-parser to enable")
+        print("  Thinking: Use --enable-thinking to enable")
     print("=" * 60)
 
     print(f"Loading model: {args.model}")

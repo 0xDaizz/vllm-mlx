@@ -380,9 +380,11 @@ class SimpleEngine(BaseEngine):
         # For LLM, apply chat template and stream
         tokenizer = self._model.tokenizer
         if hasattr(tokenizer, "apply_chat_template"):
-            # Disable thinking mode for coder models since it interferes
-            # with tool call parsing (tags leak as raw text).
-            enable_thinking = "coder" not in self._model_name.lower()
+            # Thinking mode is controlled by the server's --reasoning-parser
+            # or auto-detection. When thinking is enabled, a parser is active
+            # to separate <think>...</think> from the response content.
+            import os
+            enable_thinking = os.environ.get("VLLM_MLX_ENABLE_THINKING", "") == "1"
             template_kwargs = {
                 "tokenize": False,
                 "add_generation_prompt": True,

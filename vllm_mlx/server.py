@@ -1867,9 +1867,11 @@ async def stream_chat_completion(
     )
     yield f"data: {first_chunk.model_dump_json()}\n\n"
 
-    # Track if we need to add <think> prefix for thinking models (when no reasoning parser)
-    # The template adds <think> to the prompt, so the model output starts inside the think block
-    is_thinking_model = "nemotron" in request.model.lower() and not _reasoning_parser
+    # Thinking mode is controlled by VLLM_MLX_ENABLE_THINKING env var.
+    # When a reasoning parser is active, it handles extraction properly.
+    # The <think> prefix is only needed as fallback when thinking is enabled
+    # but no parser is active (shouldn't happen with current auto-detect logic).
+    is_thinking_model = os.environ.get("VLLM_MLX_ENABLE_THINKING", "") == "1" and not _reasoning_parser
     think_prefix_sent = False
 
     # Reset reasoning parser state for this stream
@@ -1954,7 +1956,9 @@ async def stream_chat_completion(
 
             # Add <think> prefix on first content chunk for thinking models
             if is_thinking_model and not think_prefix_sent and content:
-                content = "<think>" + content
+                # Guard against double <think> if model already emits the tag
+                if not content.lstrip().startswith("<think>"):
+                    content = "<think>" + content
                 think_prefix_sent = True
 
             # Tool call streaming parsing
@@ -2182,14 +2186,43 @@ Examples:
     if args.mcp_config:
         os.environ["VLLM_MLX_MCP_CONFIG"] = args.mcp_config
 
-    # Initialize reasoning parser if specified
-    if args.reasoning_parser:
+    # --- Thinking mode ---
+    # --enable-thinking: model generates <think>...</think> before responding.
+    # --reasoning-parser: explicit parser choice (implies --enable-thinking).
+    enable_thinking = getattr(args, 'enable_thinking', False) or bool(args.reasoning_parser)
+
+    if enable_thinking and not args.reasoning_parser:
+        # Auto-detect parser from model name
+        _thinking_model_map = {
+            "kimi": "kimi",
+            "qwen3": "qwen3",
+            "deepseek-r1": "deepseek_r1",
+            "deepseek_r1": "deepseek_r1",
+        }
+        model_lower = args.model.lower()
+        for pattern, parser_name in _thinking_model_map.items():
+            if pattern in model_lower:
+                args.reasoning_parser = parser_name
+                break
+        if not args.reasoning_parser:
+            # Fallback: use deepseek_r1 parser (generic <think> tag handler)
+            args.reasoning_parser = "deepseek_r1"
+        logger.info(f"Thinking mode enabled, parser: {args.reasoning_parser}")
+
+    # Activate reasoning parser
+    if enable_thinking and args.reasoning_parser:
         global _reasoning_parser
         from .reasoning import get_parser
-
         parser_cls = get_parser(args.reasoning_parser)
         _reasoning_parser = parser_cls()
-        logger.info(f"Reasoning parser enabled: {args.reasoning_parser}")
+        logger.info(f"Reasoning parser activated: {args.reasoning_parser}")
+
+    # Export flag for engine
+    if enable_thinking:
+        os.environ["VLLM_MLX_ENABLE_THINKING"] = "1"
+    else:
+        os.environ.pop("VLLM_MLX_ENABLE_THINKING", None)
+    os.environ.pop("VLLM_MLX_REASONING_PARSER", None)  # No longer needed
 
     # Configure tool calling
     if getattr(args, 'enable_auto_tool_choice', False) and getattr(args, 'tool_call_parser', None):
