@@ -1073,18 +1073,17 @@ class Scheduler:
             if rid in batch_request_ids:
                 i = batch_request_ids.index(rid)
                 batch_idx = batch_indices[i]
-                batch.tokens[batch_idx] = mx.concatenate(
-                    (batch.tokens[batch_idx], mx.array([batch_y[batch_idx]]))
-                )
+                # Batch all new tokens into a single concatenation
                 tokens_for_cache = result.accepted_tokens[:-1] if result.accepted_tokens else []
-                for token in tokens_for_cache:
+                new_tokens = [batch_y[batch_idx]] + tokens_for_cache
+                if new_tokens:
                     batch.tokens[batch_idx] = mx.concatenate(
-                        (batch.tokens[batch_idx], mx.array([token]))
+                        (batch.tokens[batch_idx], mx.array(new_tokens))
                     )
                 n_committed = len(result.accepted_tokens)
                 batch.num_tokens[batch_idx] += n_committed
 
-        mx.eval(batch.y)
+        mx.eval(batch.y, *batch.tokens)
 
         # Broadcast SpecDecodeResult to workers
         if self._communicator is not None and self._communicator.is_distributed:
@@ -1377,22 +1376,18 @@ class Scheduler:
             if rid in batch_request_ids:
                 i = batch_request_ids.index(rid)
                 batch_idx = batch_indices[i]
-                # Append y (the previous batch.y that was just processed)
-                batch.tokens[batch_idx] = mx.concatenate(
-                    (batch.tokens[batch_idx], mx.array([batch_y[batch_idx]]))
-                )
-                # Append accepted drafts (all committed tokens EXCEPT the
-                # last one which is the bonus/correction = new batch.y)
+                # Batch all new tokens into a single concatenation
                 tokens_for_cache = result.accepted_tokens[:-1] if result.accepted_tokens else []
-                for token in tokens_for_cache:
+                new_tokens = [batch_y[batch_idx]] + tokens_for_cache
+                if new_tokens:
                     batch.tokens[batch_idx] = mx.concatenate(
-                        (batch.tokens[batch_idx], mx.array([token]))
+                        (batch.tokens[batch_idx], mx.array(new_tokens))
                     )
                 # num_tokens tracks output tokens (all committed including bonus)
                 n_committed = len(result.accepted_tokens)
                 batch.num_tokens[batch_idx] += n_committed
 
-        mx.eval(batch.y)
+        mx.eval(batch.y, *batch.tokens)
 
         return responses
 

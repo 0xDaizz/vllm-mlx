@@ -416,7 +416,6 @@ def _worker_spec_decode_step(
     # 5. Update batch state
     # Set new batch.y
     batch.y = mx.array(spec_result.new_y, dtype=mx.int32)
-    mx.eval(batch.y)
 
     # Update tokens and num_tokens for each request
     for rid, accepted in spec_result.accepted_tokens.items():
@@ -435,19 +434,19 @@ def _worker_spec_decode_step(
         # Find original y for this position
         orig_y = batch_y[batch_idx] if batch_idx < len(batch_y) else 0
 
-        # Append y (the token that was fed to model) to tokens
-        batch.tokens[batch_idx] = mx.concatenate(
-            (batch.tokens[batch_idx], mx.array([orig_y]))
-        )
-        # Append accepted drafts (all except last which becomes new batch.y)
+        # Batch all new tokens into a single concatenation
         tokens_for_cache = accepted[:-1] if accepted else []
-        for token in tokens_for_cache:
+        new_tokens = [orig_y] + tokens_for_cache
+        if new_tokens:
             batch.tokens[batch_idx] = mx.concatenate(
-                (batch.tokens[batch_idx], mx.array([token]))
+                (batch.tokens[batch_idx], mx.array(new_tokens))
             )
         # Update num_tokens
         n_committed = len(accepted)
         batch.num_tokens[batch_idx] += n_committed
+
+    # Materialize all updated tensors to prevent lazy graph accumulation
+    mx.eval(batch.y, *batch.tokens)
 
     # 6. Return finished IDs for removal
     return set(spec_result.finished_ids)
