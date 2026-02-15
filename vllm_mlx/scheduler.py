@@ -33,6 +33,7 @@ from .spec_decode import (
     RequestState,
     VerifyResult,
 )
+from .spec_decode.cache_utils import batch_variable_trim, can_per_seq_trim
 from .spec_decode.ngram_proposer import NgramProposer
 from .spec_decode.rejection_sampler import RejectionSampler
 from .utils.mamba_cache import ensure_mamba_support
@@ -723,6 +724,22 @@ class Scheduler:
                 num_speculative_tokens=self.config.num_speculative_tokens,
             )
             proposer = NgramProposer(proposer_config)
+        elif self.config.speculative_method == "draft_model":
+            from .spec_decode.draft_model_proposer import (
+                DraftModelProposer,
+                DraftModelProposerConfig,
+            )
+
+            if not self.config.draft_model_name:
+                raise ValueError(
+                    "draft_model_name must be set when using speculative_method='draft_model'"
+                )
+            proposer_config = DraftModelProposerConfig(
+                num_speculative_tokens=self.config.num_speculative_tokens,
+                draft_model_name=self.config.draft_model_name,
+            )
+            proposer = DraftModelProposer(proposer_config)
+            proposer.load()
         else:
             raise ValueError(
                 f"Unknown speculative method: {self.config.speculative_method}"
@@ -772,6 +789,10 @@ class Scheduler:
             model_type = self.model.args.model_type
             if model_type in ("mamba", "jamba", "nemotron"):
                 return False
+        # Check cache supports per-sequence trim (CacheList layers may not)
+        batch = self.batch_generator.active_batch
+        if batch is not None and not can_per_seq_trim(batch.cache):
+            return False
         return True
 
     def _build_spec_decode_plan(self):
@@ -922,6 +943,16 @@ class Scheduler:
         # Rejection sampling
         accept_results = runtime.accept_and_commit(verify_result, draft_metadata)
 
+        # Log spec decode stats periodically
+        k = runtime.config.num_speculative_tokens
+        if runtime.stats.num_drafts % 50 == 0 and runtime.stats.num_drafts > 0:
+            logger.info(
+                f"[SpecDecode] steps={runtime.stats.num_drafts}, "
+                f"alpha={runtime.stats.acceptance_rate():.3f}, "
+                f"mean_accepted={runtime.stats.mean_accepted_length():.2f}/{k}, "
+                f"per_pos={[f'{r:.2f}' for r in runtime.stats.acceptance_rate_per_position]}"
+            )
+
         # Build Response objects and compute rollback/trim (same as _step_spec_decode)
         responses = []
         stop_tokens = self._get_stop_tokens()
@@ -943,9 +974,17 @@ class Scheduler:
                 request.sampling_params.max_tokens - request.num_output_tokens
             )
 
-            for t_idx, token in enumerate(result.accepted_tokens):
+            # Build committed tokens: old batch.y + accepted drafts (excluding
+            # the final bonus/correction token which becomes new batch.y).
+            committed_tokens = (
+                [batch_y[batch_idx]] + result.accepted_tokens[:-1]
+                if result.accepted_tokens
+                else []
+            )
+
+            for t_idx, token in enumerate(committed_tokens):
                 if tokens_remaining <= 0:
-                    unemitted = len(result.accepted_tokens) - t_idx
+                    unemitted = len(committed_tokens) - t_idx
                     rollback_counts[rid] = rollback_counts.get(rid, 0) + unemitted
                     break
 
@@ -963,7 +1002,7 @@ class Scheduler:
                 tokens_remaining -= 1
 
                 if finish_reason is not None:
-                    unemitted = len(result.accepted_tokens) - t_idx - 1
+                    unemitted = len(committed_tokens) - t_idx - 1
                     if unemitted > 0:
                         rollback_counts[rid] = rollback_counts.get(rid, 0) + unemitted
                     finished_in_spec.append(rid)
@@ -990,7 +1029,7 @@ class Scheduler:
 
         if any(t > 0 for t in trim_amounts):
             trim_array = mx.array(trim_amounts, dtype=mx.int32)
-            batch.cache.trim_per_sequence(trim_array)
+            batch_variable_trim(batch.cache, trim_array)
 
         # Update batch state (new_y, logprobs, tokens, num_tokens)
         new_y = []
@@ -1174,6 +1213,15 @@ class Scheduler:
         # 6. Run rejection sampling
         accept_results = runtime.accept_and_commit(verify_result, draft_metadata)
 
+        # Log spec decode stats periodically
+        if runtime.stats.num_drafts % 50 == 0 and runtime.stats.num_drafts > 0:
+            logger.info(
+                f"[SpecDecode] steps={runtime.stats.num_drafts}, "
+                f"alpha={runtime.stats.acceptance_rate():.3f}, "
+                f"mean_accepted={runtime.stats.mean_accepted_length():.2f}/{k}, "
+                f"per_pos={[f'{r:.2f}' for r in runtime.stats.acceptance_rate_per_position]}"
+            )
+
         # 7. Build Response objects and apply stop/max-token checks
         responses = []
         stop_tokens = self._get_stop_tokens()
@@ -1195,23 +1243,26 @@ class Scheduler:
                 request.sampling_params.max_tokens - request.num_output_tokens
             )
 
-            # Emit one Response per committed token (with stop/max-token clipping)
-            for t_idx, token in enumerate(result.accepted_tokens):
+            # Build committed tokens: old batch.y + accepted drafts (excluding
+            # the final bonus/correction token which becomes new batch.y).
+            committed_tokens = (
+                [batch_y[batch_idx]] + result.accepted_tokens[:-1]
+                if result.accepted_tokens
+                else []
+            )
+
+            for t_idx, token in enumerate(committed_tokens):
                 if tokens_remaining <= 0:
-                    # Truncate: don't emit more tokens
-                    # Adjust rollback count for unemitted tokens
-                    unemitted = len(result.accepted_tokens) - t_idx
+                    unemitted = len(committed_tokens) - t_idx
                     rollback_counts[rid] = rollback_counts.get(rid, 0) + unemitted
                     break
 
-                # Check stop token
                 finish_reason = None
                 if token in stop_tokens:
                     finish_reason = "stop"
                 elif tokens_remaining == 1:
                     finish_reason = "length"
 
-                # Create a Response-like object
                 resp = type(
                     "Response",
                     (),
@@ -1227,8 +1278,7 @@ class Scheduler:
                 tokens_remaining -= 1
 
                 if finish_reason is not None:
-                    # Stop emitting tokens for this request
-                    unemitted = len(result.accepted_tokens) - t_idx - 1
+                    unemitted = len(committed_tokens) - t_idx - 1
                     if unemitted > 0:
                         rollback_counts[rid] = (
                             rollback_counts.get(rid, 0) + unemitted
@@ -1262,7 +1312,7 @@ class Scheduler:
 
         if any(t > 0 for t in trim_amounts):
             trim_array = mx.array(trim_amounts, dtype=mx.int32)
-            batch.cache.trim_per_sequence(trim_array)
+            batch_variable_trim(batch.cache, trim_array)
 
         # 9. Update batch state for next step
         # After spec decode, we need batch.y and batch.logprobs set correctly
@@ -2521,20 +2571,22 @@ class Scheduler:
                             if self._communicator is not None and self._communicator.is_distributed:
                                 from vllm_mlx.distributed import SpecDecodeResult
                                 batch = self.batch_generator.active_batch
+                                # Workers already ran forward with [y] + drafts
+                                # (max_draft_len + 1 tokens), so trim must undo all of them.
+                                noop_trim = spec_pending_state["max_draft_len"] + 1
                                 noop_result = SpecDecodeResult(
                                     step_id=self._step_count,
                                     accepted_tokens={},
-                                    trim_amounts=[spec_pending_state["max_draft_len"]] * len(batch.uids) if batch else [],
+                                    trim_amounts=[noop_trim] * len(batch.uids) if batch else [],
                                     new_y=spec_pending_state["batch_y"],
                                     finished_ids=[],
                                 )
                                 self._communicator.broadcast_spec_decode_result(noop_result)
                                 # Apply the same rollback on rank 0 to keep state consistent
                                 if batch is not None and noop_result.trim_amounts:
-                                    import mlx.core as mx
                                     if any(t > 0 for t in noop_result.trim_amounts):
                                         trim_array = mx.array(noop_result.trim_amounts, dtype=mx.int32)
-                                        batch.cache.trim_per_sequence(trim_array)
+                                        batch_variable_trim(batch.cache, trim_array)
                                     batch.y = mx.array(noop_result.new_y, dtype=mx.int32)
                             spec_responses = None
 
@@ -2774,6 +2826,8 @@ class Scheduler:
                 "total_draft_tokens": self._spec_decode_runtime.stats.num_draft_tokens,
                 "total_accepted": self._spec_decode_runtime.stats.num_accepted_tokens,
                 "acceptance_rate": self._spec_decode_runtime.stats.acceptance_rate(),
+                "mean_accepted_length": self._spec_decode_runtime.stats.mean_accepted_length(),
+                "per_position_acceptance": self._spec_decode_runtime.stats.acceptance_rate_per_position,
             }
 
         return stats

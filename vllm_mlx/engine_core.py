@@ -182,8 +182,8 @@ class EngineCore:
         stream_interval = self.config.stream_interval
         use_simple_streaming = stream_interval == 1
 
-        # Emergency memory pressure threshold (200GB)
-        _memory_pressure_threshold = 200 * 1024 * 1024 * 1024
+        # Emergency memory pressure threshold
+        _memory_pressure_threshold = 500 * 1024 * 1024 * 1024
         _memory_check_interval = 64
 
         while self._running:

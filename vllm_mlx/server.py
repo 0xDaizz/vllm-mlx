@@ -588,6 +588,7 @@ async def status():
         "cache": stats.get("memory_aware_cache")
         or stats.get("paged_cache")
         or stats.get("prefix_cache"),
+        "spec_decode": stats.get("spec_decode"),
         "requests": stats.get("requests", []),
     }
 

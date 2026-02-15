@@ -20,6 +20,7 @@ Usage:
     config = SpecDecodeConfig(method="ngram", num_speculative_tokens=5)
 """
 
+from .draft_model_proposer import DraftModelProposer, DraftModelProposerConfig
 from .metadata import SpecDecodeConfig, SpecDecodeMetadata
 from .metrics import SpecDecodeStats
 from .proposer import BaseProposer, ProposerConfig
@@ -32,6 +33,9 @@ __all__ = [
     # Proposer abstractions
     "BaseProposer",
     "ProposerConfig",
+    # Draft model proposer
+    "DraftModelProposer",
+    "DraftModelProposerConfig",
     # Metrics
     "SpecDecodeStats",
     # Runtime

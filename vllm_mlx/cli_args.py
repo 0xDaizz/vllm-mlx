@@ -275,7 +275,7 @@ def add_speculative_decoding_args(parser: argparse.ArgumentParser) -> None:
         "--speculative-method",
         type=str,
         default=None,
-        choices=["ngram"],
+        choices=["ngram", "draft_model"],
         help="Speculative decoding method (default: disabled)",
     )
     parser.add_argument(
@@ -289,6 +289,12 @@ def add_speculative_decoding_args(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=None,
         help="Disable speculative decoding when batch size exceeds this value",
+    )
+    parser.add_argument(
+        "--draft-model",
+        type=str,
+        default=None,
+        help="Path to draft model for speculative decoding (required with --speculative-method draft_model)",
     )
 
 
@@ -423,6 +429,7 @@ def build_scheduler_config(args):
         spec_decode_disable_batch_size=getattr(
             args, "spec_decode_disable_batch_size", None
         ),
+        draft_model_name=getattr(args, "draft_model", None),
     )
 
 
@@ -450,6 +457,20 @@ def validate_serve_args(args) -> None:
         args, "continuous_batching", False
     ):
         sys.exit("Error: --speculative-method requires --continuous-batching")
+
+    # Draft model method requires --draft-model
+    if getattr(args, "speculative_method", None) == "draft_model" and not getattr(
+        args, "draft_model", None
+    ):
+        sys.exit("Error: --speculative-method draft_model requires --draft-model")
+
+    # --draft-model without draft_model method is a warning
+    if getattr(args, "draft_model", None) and getattr(
+        args, "speculative_method", None
+    ) != "draft_model":
+        warnings.warn(
+            "--draft-model has no effect without --speculative-method draft_model"
+        )
 
     # Distributed checks
     if hasattr(args, "distributed") and args.distributed:
@@ -549,6 +570,7 @@ def rebuild_server_args_from_namespace(args) -> list[str]:
         ("reasoning_parser", "--reasoning-parser"),
         ("speculative_method", "--speculative-method"),
         ("spec_decode_disable_batch_size", "--spec-decode-disable-batch-size"),
+        ("draft_model", "--draft-model"),
         ("mcp_config", "--mcp-config"),
         ("embedding_model", "--embedding-model"),
         ("default_temperature", "--default-temperature"),

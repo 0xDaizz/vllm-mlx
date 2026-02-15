@@ -378,18 +378,11 @@ def _worker_spec_decode_step(
 
     batch = batch_generator.active_batch
     if batch is None:
-        # StepPlan sync should prevent this, but handle gracefully.
-        # We cannot run model forward without matching cache state,
-        # so TP all_sum may deadlock if rank 0 is running forward.
-        logger.error(
+        raise RuntimeError(
             f"[Rank {communicator.rank}] spec_decode_plan received but no active batch. "
-            "Worker batch state is desynchronized from rank 0."
+            "Worker batch state is desynchronized from rank 0. "
+            "Cannot participate in TP forward — this would cause a deadlock."
         )
-        # Still receive the SpecDecodeResult to prevent hanging on the receive side.
-        # NOTE: The TP forward in rank 0 may hang if workers don't participate.
-        # This is a sync bug that should be investigated.
-        communicator.receive_spec_decode_result()
-        return set()
 
     # 1. Build input tensor from SpecDecodePlan (must match rank 0 exactly)
     batch_y = spec_plan.batch_y
@@ -416,8 +409,9 @@ def _worker_spec_decode_step(
 
     # 4. Apply KV cache trim
     if spec_result.trim_amounts and any(t > 0 for t in spec_result.trim_amounts):
+        from vllm_mlx.spec_decode.cache_utils import batch_variable_trim
         trim_array = mx.array(spec_result.trim_amounts, dtype=mx.int32)
-        batch.cache.trim_per_sequence(trim_array)
+        batch_variable_trim(batch.cache, trim_array)
 
     # 5. Update batch state
     # Set new batch.y
