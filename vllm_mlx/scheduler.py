@@ -720,6 +720,19 @@ class Scheduler:
             auto_disable_window=self.config.spec_decode_auto_disable_window,
         )
 
+        # In distributed/TP mode, disable auto-disable to prevent protocol
+        # mismatch between rank 0 and workers.  When auto-disable triggers,
+        # _build_spec_decode_plan returns (None, None) but workers still
+        # expect a spec decode round, causing a hang.
+        if self._communicator is not None and self._communicator.is_distributed:
+            if spec_config.auto_disable_threshold > 0.0:
+                logger.info(
+                    "Disabling spec decode auto-disable in TP mode "
+                    "(was threshold=%.3f) to prevent TP desync",
+                    spec_config.auto_disable_threshold,
+                )
+                spec_config.auto_disable_threshold = 0.0
+
         # Create proposer based on method
         if self.config.speculative_method == "ngram":
             from .spec_decode.ngram_proposer import NgramProposer, NgramProposerConfig
@@ -933,6 +946,29 @@ class Scheduler:
 
         input_tokens = mx.array(input_rows, dtype=mx.int32)
 
+        logger.debug(
+            "[SpecDecode TP] step=%d, input_shape=%s, n_reqs=%d, "
+            "cache_idx=%s, draft_lengths=%s",
+            self._step_count,
+            input_tokens.shape,
+            len(batch_request_ids),
+            batch.cache[0]._idx if batch.cache else "N/A",
+            draft_lengths,
+        )
+
+        # Sanity check: ensure cache _idx is consistent before TP forward
+        if batch.cache:
+            from vllm_mlx.spec_decode.cache_utils import fixup_cache_after_filter
+            expected_idx = int(mx.max(batch.cache[0].left_padding + batch.cache[0].offset).item())
+            actual_idx = batch.cache[0]._idx
+            if actual_idx != expected_idx:
+                logger.warning(
+                    "[SpecDecode TP] cache _idx mismatch before forward: "
+                    "actual=%d, expected=%d, fixing",
+                    actual_idx, expected_idx,
+                )
+                fixup_cache_after_filter(batch.cache)
+
         # Run model forward (TP all_sum happens inside)
         logits = self.model(input_tokens, cache=batch.cache)
         mx.eval(logits)
@@ -1043,6 +1079,20 @@ class Scheduler:
             # Materialize trim results before further cache operations
             if batch.cache:
                 mx.eval(batch.cache[0].offset, batch.cache[0].left_padding)
+            # Recompute _idx after trim to prevent stale values
+            from vllm_mlx.spec_decode.cache_utils import fixup_cache_after_filter
+            fixup_cache_after_filter(batch.cache)
+
+        logger.debug(
+            "[SpecDecode TP] step=%d post-trim: trim_amounts=%s, "
+            "accepted_per_req={%s}",
+            self._step_count,
+            trim_amounts,
+            ", ".join(
+                f"{rid}: {res.num_accepted}"
+                for rid, res in accept_results.items()
+            ),
+        )
 
         # Update batch state (new_y, logprobs, tokens, num_tokens)
         new_y = []
@@ -1339,6 +1389,11 @@ class Scheduler:
         if any(t > 0 for t in trim_amounts):
             trim_array = mx.array(trim_amounts, dtype=mx.int32)
             batch_variable_trim(batch.cache, trim_array)
+            # Materialize and fix _idx after trim
+            if batch.cache:
+                mx.eval(batch.cache[0].offset, batch.cache[0].left_padding)
+            from vllm_mlx.spec_decode.cache_utils import fixup_cache_after_filter
+            fixup_cache_after_filter(batch.cache)
 
         # 9. Update batch state for next step
         # After spec decode, we need batch.y and batch.logprobs set correctly
