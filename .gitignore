@@ -95,3 +95,6 @@ temp/
 
 # MLX cache
 .mlx_cache/
+
+# Local scripts (contain environment-specific paths/IPs)
+scripts/

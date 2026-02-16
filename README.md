@@ -384,6 +384,14 @@ GEMMA3_SLIDING_WINDOW=0 vllm-mlx serve mlx-community/gemma-3-27b-it-4bit --port 
 | `GEMMA3_SLIDING_WINDOW=8192` | ~40K tokens | ~25GB |
 | `GEMMA3_SLIDING_WINDOW=0` | ~50K tokens | ~35GB |
 
+## Known Issues / TODO
+
+### Speculative Decoding
+
+- **Single node**: n-gram speculative decoding works correctly on a single Mac Studio. Verified on M4 Ultra 512GB with Moonlight-16B model, up to k=5 draft tokens.
+- **Distributed TP (k≥2 deadlock)**: When running n-gram speculative decoding with k≥2 draft tokens across 2 nodes via Tensor Parallel, a deterministic deadlock occurs inside model forward (`all_sum`). Both ranks hang at `cache_idx=242` with matching state — not a protocol desync issue. k=1 works fine. Root cause under investigation. See [Bug Report](docs/spec_decode_tp_bugs.md) for details.
+- **TP output quality**: Distributed TP inference may produce lower quality output compared to single-node inference, possibly due to bfloat16 precision accumulation across 61 layers of `all_sum` operations. Under investigation.
+
 ## Contributing
 
 We welcome contributions! See [Contributing Guide](docs/development/contributing.md) for details.

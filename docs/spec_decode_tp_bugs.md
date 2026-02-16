@@ -395,7 +395,7 @@ Rank 1: 116 MATCH, 0 MISMATCH
 ## 버그 7: k≥2 Spec Decode TP 데드락 — Step 50에서 결정론적 행
 
 > 발견일: 2026-02-16
-> 상태: **🔴 활발히 조사 중 (commit 878fc00에서 첫 시도 실패)**
+> 상태: **🔴 활발히 조사 중 — cache_idx=242에서 결정론적 all_sum 데드락 (`878fc00`, `49de3e9`, `4b1c446`)**
 > 환경: Kimi K2.5, TP=2 (2x Mac Studio M4 Ultra, TB5 RDMA), n-gram speculative decoding
 
 ### 증상
@@ -427,13 +427,38 @@ Rank 1: 116 MATCH, 0 MISMATCH
 2. cache _idx consistency check + fixup_cache_after_filter 추가 (scheduler.py)
 3. batch_variable_trim 후 fixup_cache_after_filter 호출 (scheduler.py)
 4. DEBUG 레벨 진단 로깅 (서버 INFO 레벨이라 출력 안 됨)
+5. INFO 레벨 진단 로깅 (`49de3e9`) → 데드락 위치 특정 (model forward 내부)
+6. mx.eval() 배리어 5곳 추가 (`4b1c446`) → 효과 없음, 동일 위치에서 행
+
+### 진단 결과 (2026-02-16, commit `49de3e9` + `4b1c446`)
+
+INFO 레벨 진단 로깅 (`[SD-TP]`, `[SD-W]` prefix)을 배포하여 데드락 위치를 정확히 특정:
+
+**두 번의 재현에서 동일한 결과:**
+- Rank 0: `step=N PRE-FORWARD input_shape=(1, 2) cache_idx=242` ← 마지막 로그
+- Rank 1: `PRE-FORWARD input_shape=(1, 2) cache_idx=242` ← 마지막 로그
+- **양쪽 Rank 모두 동일한 상태로 model forward에 진입 후 all_sum 내부에서 데드락**
+- 프로토콜 desync 아님 (cache_idx, input_shape 모두 일치)
+
+**시도한 수정과 결과:**
+1. `fixup_cache_after_filter` 추가 (`878fc00`) → 행이 step 50에서 step ~87로 이동 (지연만, 해결 아님)
+2. `mx.eval()` 배리어 추가 (`4b1c446`) → **효과 없음**, 동일한 cache_idx=242에서 행
+
+**배제된 추가 가설:**
+- **Lazy evaluation 누적**: mx.eval 배리어를 5곳에 추가했으나 동일 위치에서 행 → lazy graph 아님
+- **프로토콜 desync**: 양 Rank의 cache_idx, input_shape 완전 일치 → 통신 프로토콜 문제 아님
+
+**남은 가설:**
+1. **cache_idx=242 특수성**: 두 번의 실행에서 정확히 같은 cache 크기에서 행 → KV cache 용량 한계 또는 Metal 버퍼 크기 제한 가능성
+2. **JACCL/RDMA 리소스 고갈**: 누적된 all_sum 연산 후 RDMA 버퍼 부족
+3. **spec decode 경로 고유의 cache 레이아웃 문제**: baseline은 256+ 토큰 정상 완료 (cache_idx > 273), spec decode만 242에서 행
 
 ### 다음 조사 단계
 
-1. INFO 레벨 진단 로깅 배포 ([SD-TP], [SD-W] prefix)
-2. ngram-k2 재실행하여 데드락 직전 마지막 로그 확인
-3. 데드락 위치 특정: model forward (all_sum) vs broadcast/receive vs batch state update
-4. Rank 간 cache state 비교 (offset, left_padding, _idx)
+1. spec decode cache 할당 크기 확인 (max_tokens + k 고려 여부)
+2. 더 작은 max_tokens (예: 128)로 테스트하여 cache_idx 한계점 검증
+3. all_sum 호출 횟수 대비 baseline과 비교
+4. model forward 내부 레이어별 로깅 추가
 
 ### 관련 코드 위치
 
