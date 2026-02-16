@@ -892,10 +892,11 @@ class Scheduler:
                     model_config, decoder_layer_cls=decoder_layer_cls,
                 )
 
-            # Load MTP weights
+            # Load MTP weights (and quantize to match main model if needed)
             load_mtp_weights(
                 mtp_model_path, model_config.num_hidden_layers, mtp_module,
                 model_config=model_config, mtp_prefix=mtp_prefix,
+                main_model=self.model,
             )
 
             # Create proposer with shared embed_fn and lm_head
@@ -1441,9 +1442,20 @@ class Scheduler:
         # the existing KV cache. The model returns logits for each position.
         _is_mtp = self.config.speculative_method == "mtp"
         if _is_mtp:
-            # Capture hidden states for MTP: run backbone and lm_head separately
-            hidden_states = self.model.model(input_tokens, cache=batch.cache)
-            logits = self.model.lm_head(hidden_states)
+            # Capture PRE-NORM hidden states for MTP.
+            # model.model.__call__() applies self.norm(h) at the end,
+            # but MTP's hnorm expects raw decoder layer output.
+            inner = self.model.model  # DeepseekV32Model (or equivalent backbone)
+            h = inner.embed_tokens(input_tokens)
+            # Build attention mask using the first layer's cache offset
+            _c0 = batch.cache[0]
+            _cache_for_mask = _c0[0] if isinstance(_c0, (list, tuple)) else _c0
+            from mlx_lm.models.base import create_attention_mask
+            mask = create_attention_mask(h, _cache_for_mask, return_array=True)
+            for i in range(inner.num_layers):
+                h = inner.layers[inner.start_idx + i](h, mask, batch.cache[i])
+            hidden_states = h  # Pre-norm hidden states for MTP
+            logits = self.model.lm_head(inner.norm(h))
         else:
             logits = self.model(input_tokens, cache=batch.cache)
             hidden_states = None

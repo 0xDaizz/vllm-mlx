@@ -16,8 +16,27 @@ from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.nn.layers.quantized import QuantizedLinear
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_quantization_config(model: nn.Module) -> dict | None:
+    """Extract quantization config from the first QuantizedLinear in *model*.
+
+    Traverses all sub-modules of *model* (via ``named_modules()``) and returns
+    the ``bits``, ``group_size`` and ``mode`` of the first
+    :class:`QuantizedLinear` found.  Returns ``None`` if the model is not
+    quantized.
+    """
+    for _name, module in model.named_modules():
+        if isinstance(module, QuantizedLinear):
+            return {
+                "bits": module.bits,
+                "group_size": module.group_size,
+                "mode": module.mode,
+            }
+    return None
 
 
 @dataclass
@@ -289,6 +308,7 @@ def load_mtp_weights(
     mtp_module: nn.Module,
     model_config: Any = None,
     mtp_prefix: str | None = None,
+    main_model: nn.Module | None = None,
 ) -> None:
     """Load MTP layer weights from safetensors, bypassing mlx-lm sanitize().
 
@@ -298,6 +318,10 @@ def load_mtp_weights(
     expert stacking, kv_b_proj splitting), and loads them into the MTP module
     with key remapping.
 
+    When *main_model* is given and is quantized, the MTP module is quantized
+    to the same bit-width / group-size after weight loading so that the two
+    modules operate at the same precision.
+
     Args:
         model_path: Path to the model directory containing safetensors files.
         num_hidden_layers: Number of hidden layers in the main model.
@@ -305,6 +329,9 @@ def load_mtp_weights(
         model_config: Model configuration (e.g. ``model.args``).  When
             provided the raw weights are run through
             :func:`_sanitize_mtp_weights` before key remapping.
+        mtp_prefix: Override auto-detected MTP weight prefix.
+        main_model: The main (target) model.  When provided and quantized,
+            the MTP module will be quantized to the same configuration.
     """
     model_dir = Path(model_path)
 
@@ -436,3 +463,35 @@ def load_mtp_weights(
     # Load into MTP module
     mtp_module.load_weights(list(remapped.items()))
     logger.info("Loaded %d MTP weight tensors into MTP module", len(remapped))
+
+    # Apply quantization to match main model if quantized
+    if main_model is not None:
+        quant_config = _extract_quantization_config(main_model)
+        if quant_config is not None:
+            from mlx.utils import tree_flatten
+
+            pre_size = sum(
+                v.nbytes
+                for _, v in tree_flatten(mtp_module.parameters())
+            )
+            nn.quantize(
+                mtp_module,
+                group_size=quant_config["group_size"],
+                bits=quant_config["bits"],
+                mode=quant_config["mode"],
+            )
+            post_size = sum(
+                v.nbytes
+                for _, v in tree_flatten(mtp_module.parameters())
+            )
+            saved_mb = (pre_size - post_size) / (1024 * 1024)
+            logger.info(
+                "Quantized MTP module to %d-bit (group_size=%d, mode=%s): "
+                "%.0f MB -> %.0f MB (saved %.0f MB)",
+                quant_config["bits"],
+                quant_config["group_size"],
+                quant_config["mode"],
+                pre_size / (1024 * 1024),
+                post_size / (1024 * 1024),
+                saved_mb,
+            )
