@@ -143,7 +143,27 @@
 
 **원인**: `LLMModel.stream_generate()` → `mlx_lm.stream_generate()`가 `prompt_tokens` 정보를 streaming output에 포함하지 않음.
 
-**영향**: prefill tok/s 계산 불가. 벤치마크에서는 TTFT만 사용.
+**수정**: `simple.py`에서 스트림 루프 전에 `tokenizer.encode(prompt)`로 사전 계산. (commit 907a504)
+
+---
+
+## 벤치마크 후 개선 사항 (commit 907a504)
+
+벤치마크 결과를 바탕으로 Codex와 상의하여 아래 3가지 개선을 적용:
+
+### 1. RejectionSampler 벡터화
+- per-token `.item()` host sync를 제거하고 on-device 벡터 연산으로 전환
+- Greedy: `mx.argmax` + `mx.cumprod`으로 first-mismatch 탐지, 단일 `mx.eval()` 호출
+- Stochastic: 배치 확률 gather + 일괄 난수 생성
+
+### 2. 적응형 spec decode 자동 비활성화
+- Rolling window (default 50 rounds)로 실시간 acceptance rate 추적
+- Threshold (default 0.4) 이하로 떨어지면 자동 비활성화
+- 주기적 probe round로 조건 개선 시 자동 재활성화
+- CLI: `--spec-decode-auto-disable-threshold`, `--spec-decode-auto-disable-window`
+
+### 3. SimpleEngine prompt_tokens 수정
+- 스트림 루프 전에 tokenizer로 사전 계산 (hasattr guard 포함)
 
 ---
 
