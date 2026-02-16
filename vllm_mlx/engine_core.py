@@ -190,7 +190,6 @@ class EngineCore:
         # Without this, workers enter receive_step_plan() while rank 0 is still
         # initializing (loading draft model, starting uvicorn), causing JACCL timeout.
         if self._communicator is not None and self._communicator.is_distributed:
-            import mlx.core as mx
             self._communicator.barrier()
             logger.info(
                 f"Engine ready barrier passed — workers can now receive StepPlans"
