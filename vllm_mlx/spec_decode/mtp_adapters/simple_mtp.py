@@ -59,6 +59,9 @@ class SimpleMTPModule(MTPModule):
         # Optional final norm (some models have it, weights will be loaded if present)
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+        # Detect cache factory from the model's make_cache pattern
+        self._cache_factory = self._detect_cache_factory(model_config)
+
     def __call__(
         self,
         hidden_states: mx.array,
@@ -85,12 +88,48 @@ class SimpleMTPModule(MTPModule):
         return h
 
     def make_cache(self):
-        """Create per-layer KV caches for all MTP decoder layers."""
+        """Create per-layer KV caches for all MTP decoder layers.
+
+        Returns the correct cache type per layer. Models like
+        deepseek_v32/glm_moe_dsa need CacheList(KVCache(), KVCache()),
+        while simpler models need a plain KVCache().
+        """
+        if self._cache_factory is not None:
+            return [self._cache_factory() for _ in self.layers]
         try:
-            from mlx_lm.generate import KVCache
+            from mlx_lm.models.cache import KVCache
             return [KVCache() for _ in self.layers]
         except ImportError:
             return None
+
+    @staticmethod
+    def _detect_cache_factory(model_config):
+        """Detect the per-layer cache factory from the model's make_cache pattern.
+
+        Imports the model module and checks if it uses CacheList for its cache
+        layers. Returns a callable that creates a single layer's cache, or None
+        to fall back to KVCache().
+        """
+        import importlib
+
+        model_type = getattr(model_config, "model_type", None)
+        if model_type is None:
+            return None
+
+        try:
+            mod = importlib.import_module(f"mlx_lm.models.{model_type}")
+            model_cls = getattr(mod, "Model", None)
+            if model_cls is None or not hasattr(model_cls, "make_cache"):
+                return None
+
+            from mlx_lm.models.cache import CacheList, KVCache
+
+            if hasattr(mod, "CacheList") or "CacheList" in dir(mod):
+                return lambda: CacheList(KVCache(), KVCache())
+        except (ImportError, Exception):
+            pass
+
+        return None
 
     @classmethod
     def from_model_config(

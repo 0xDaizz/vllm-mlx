@@ -65,6 +65,58 @@ class StandardMTPModule(MTPModule):
             except TypeError:
                 self.decoder_layer = decoder_layer_cls(args=model_config)
 
+        # Detect cache factory from the model's make_cache pattern.
+        # Models like deepseek_v32/glm_moe_dsa use CacheList(KVCache(), KVCache())
+        # per layer instead of a plain KVCache().
+        self._cache_factory = self._detect_cache_factory(model_config)
+
+    @staticmethod
+    def _detect_cache_factory(model_config: Any):
+        """Detect the per-layer cache factory from the model's make_cache pattern.
+
+        Imports the model module and inspects its Model.make_cache() output for
+        one layer to determine the correct cache type. Returns a callable that
+        creates a single layer's cache, or None to fall back to KVCache().
+        """
+        import importlib
+
+        model_type = getattr(model_config, "model_type", None)
+        if model_type is None:
+            return None
+
+        # Map model_type to the mlx-lm module name (same map as _resolve_decoder_cls)
+        _MODULE_MAP = {
+            "deepseek_v3": "deepseek_v3",
+            "deepseek_v32": "deepseek_v32",
+            "glm_moe_dsa": "deepseek_v32",
+            "glm4_moe_lite": "glm4_moe_lite",
+        }
+        module_name = _MODULE_MAP.get(model_type, model_type)
+
+        try:
+            mod = importlib.import_module(f"mlx_lm.models.{module_name}")
+            model_cls = getattr(mod, "Model", None)
+            if model_cls is None or not hasattr(model_cls, "make_cache"):
+                return None
+
+            # Call make_cache on the class to inspect the result.
+            # We can't instantiate the full model, so instead probe one layer's
+            # cache by creating a minimal dummy instance.
+            # Simpler approach: just check if the module imports CacheList and
+            # the make_cache source uses it.
+            from mlx_lm.models.cache import CacheList, KVCache
+
+            # Create a temporary instance just to call make_cache.
+            # This is too expensive. Instead, use a heuristic based on whether
+            # the model module references CacheList.
+            if hasattr(mod, "CacheList") or "CacheList" in dir(mod):
+                # Module uses CacheList - return factory that creates one
+                return lambda: CacheList(KVCache(), KVCache())
+        except (ImportError, Exception):
+            pass
+
+        return None
+
     @staticmethod
     def _resolve_decoder_cls(model_config: Any) -> type:
         """Auto-resolve decoder layer class from model config's model_type."""
@@ -153,9 +205,16 @@ class StandardMTPModule(MTPModule):
         return new_hidden
 
     def make_cache(self):
-        """Create KV cache for the single decoder layer."""
+        """Create KV cache for the single decoder layer.
+
+        Returns the correct cache type for the model. Models like
+        deepseek_v32/glm_moe_dsa need CacheList(KVCache(), KVCache()),
+        while simpler models need a plain KVCache().
+        """
+        if self._cache_factory is not None:
+            return self._cache_factory()
         try:
-            from mlx_lm.generate import KVCache
+            from mlx_lm.models.cache import KVCache
             return KVCache()
         except ImportError:
             return None

@@ -86,6 +86,50 @@ def _array_memory(arr) -> int:
     return 0
 
 
+def _estimate_single_cache_memory(layer_cache: Any) -> int:
+    """Estimate memory for a single cache layer object (non-CacheList).
+
+    Args:
+        layer_cache: A single cache object (KVCache, QuantizedKVCache, dict, etc.)
+
+    Returns:
+        Estimated memory in bytes.
+    """
+    total_bytes = 0
+    # Check dict first since dicts have .keys() method that would match below
+    if isinstance(layer_cache, dict) and "state" in layer_cache:
+        # Extracted state dict
+        keys, values = layer_cache["state"]
+        total_bytes += _array_memory(keys)
+        total_bytes += _array_memory(values)
+    # Handle QuantizedKVCache: keys/values are tuples of (data, scales, biases)
+    elif hasattr(layer_cache, "keys") and isinstance(
+        getattr(layer_cache, "keys", None), (list, tuple)
+    ):
+        for arr in layer_cache.keys:
+            total_bytes += _array_memory(arr)
+        for arr in layer_cache.values:
+            total_bytes += _array_memory(arr)
+    elif hasattr(layer_cache, "state") and not isinstance(layer_cache, dict):
+        # Cache with state property returning (keys, values)
+        try:
+            keys, values = layer_cache.state
+            total_bytes += _array_memory(keys)
+            total_bytes += _array_memory(values)
+        except (TypeError, ValueError):
+            pass
+    elif hasattr(layer_cache, "keys") and hasattr(layer_cache, "values"):
+        # Standard KVCache with keys/values attributes (not dict)
+        keys_attr = layer_cache.keys
+        values_attr = layer_cache.values
+        # Ensure these are arrays, not methods
+        if not callable(keys_attr):
+            total_bytes += _array_memory(keys_attr)
+        if not callable(values_attr):
+            total_bytes += _array_memory(values_attr)
+    return total_bytes
+
+
 def estimate_kv_cache_memory(cache: list[Any]) -> int:
     """
     Estimate memory usage of a KV cache in bytes.
@@ -93,6 +137,10 @@ def estimate_kv_cache_memory(cache: list[Any]) -> int:
     This function inspects MLX arrays in the cache and calculates their
     total memory footprint using shape+dtype metadata to avoid triggering
     lazy evaluation (which would cause a VRAM spike).
+
+    Handles CacheList layers (e.g., deepseek_v32, glm_moe_dsa) which contain
+    multiple sub-caches per layer. CacheList.state returns a flattened list of
+    all sub-cache states, so we iterate over sub-caches individually instead.
 
     Note on TP (Tensor Parallelism): When the model is TP-sharded, the
     cache already stores the actual tensors from this rank's model, which
@@ -108,42 +156,24 @@ def estimate_kv_cache_memory(cache: list[Any]) -> int:
     if not cache:
         return 0
 
+    # Lazy import to avoid import-time dependency on mlx_lm
+    _CacheList = None
+    try:
+        from mlx_lm.models.cache import CacheList as _CacheList
+    except ImportError:
+        pass
+
     total_bytes = 0
 
     for layer_cache in cache:
-        # Handle different cache object types
-        # Check dict first since dicts have .keys() method that would match below
-        if isinstance(layer_cache, dict) and "state" in layer_cache:
-            # Extracted state dict
-            keys, values = layer_cache["state"]
-            total_bytes += _array_memory(keys)
-            total_bytes += _array_memory(values)
-        # Handle QuantizedKVCache: keys/values are tuples of (data, scales, biases)
-        elif hasattr(layer_cache, "keys") and isinstance(
-            getattr(layer_cache, "keys", None), (list, tuple)
-        ):
-            for arr in layer_cache.keys:
-                total_bytes += _array_memory(arr)
-            for arr in layer_cache.values:
-                total_bytes += _array_memory(arr)
-            continue
-        elif hasattr(layer_cache, "state") and not isinstance(layer_cache, dict):
-            # Cache with state property returning (keys, values)
-            try:
-                keys, values = layer_cache.state
-                total_bytes += _array_memory(keys)
-                total_bytes += _array_memory(values)
-            except (TypeError, ValueError):
-                pass
-        elif hasattr(layer_cache, "keys") and hasattr(layer_cache, "values"):
-            # Standard KVCache with keys/values attributes (not dict)
-            keys_attr = layer_cache.keys
-            values_attr = layer_cache.values
-            # Ensure these are arrays, not methods
-            if not callable(keys_attr):
-                total_bytes += _array_memory(keys_attr)
-            if not callable(values_attr):
-                total_bytes += _array_memory(values_attr)
+        # Handle CacheList: iterate over sub-caches individually.
+        # CacheList.state returns a flattened list which can't be unpacked
+        # as a simple (keys, values) tuple, so we must recurse into sub-caches.
+        if _CacheList is not None and isinstance(layer_cache, _CacheList):
+            for sub_cache in layer_cache.caches:
+                total_bytes += _estimate_single_cache_memory(sub_cache)
+        else:
+            total_bytes += _estimate_single_cache_memory(layer_cache)
 
     return total_bytes
 

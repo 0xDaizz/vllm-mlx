@@ -137,6 +137,17 @@ class SchedulerOutput:
     has_work: bool = False
 
 
+def _inner_cache(layer_cache):
+    """Get the first inner cache from a CacheList, or return as-is.
+
+    Used for introspecting batch state (offset, left_padding, _idx) which
+    is shared across sub-caches in a CacheList.
+    """
+    if hasattr(layer_cache, 'caches'):
+        return layer_cache.caches[0]
+    return layer_cache
+
+
 def _install_chunked_prefill(
     batch_gen: "BatchGenerator",
     budget: int,
@@ -1092,15 +1103,16 @@ class Scheduler:
             self._step_count,
             input_tokens.shape,
             len(batch_request_ids),
-            batch.cache[0]._idx if batch.cache else "N/A",
+            _inner_cache(batch.cache[0])._idx if batch.cache else "N/A",
             draft_lengths,
         )
 
         # Sanity check: ensure cache _idx is consistent before TP forward
         if batch.cache:
             from vllm_mlx.spec_decode.cache_utils import fixup_cache_after_filter
-            expected_idx = int(mx.max(batch.cache[0].left_padding + batch.cache[0].offset).item())
-            actual_idx = batch.cache[0]._idx
+            _c0 = _inner_cache(batch.cache[0])
+            expected_idx = int(mx.max(_c0.left_padding + _c0.offset).item())
+            actual_idx = _c0._idx
             if actual_idx != expected_idx:
                 logger.warning(
                     "[SpecDecode TP] cache _idx mismatch before forward: "
@@ -1112,7 +1124,7 @@ class Scheduler:
         # Run model forward (TP all_sum happens inside)
         logger.info("[SD-TP] step=%d PRE-FORWARD input_shape=%s cache_idx=%s",
                     self._step_count, input_tokens.shape,
-                    batch.cache[0]._idx if batch.cache else "N/A")
+                    _inner_cache(batch.cache[0])._idx if batch.cache else "N/A")
         logits = self.model(input_tokens, cache=batch.cache)
         mx.eval(logits)
         logger.info("[SD-TP] step=%d POST-FORWARD logits_shape=%s",
@@ -1129,7 +1141,8 @@ class Scheduler:
         # Rejection sampling
         accept_results = runtime.accept_and_commit(verify_result, draft_metadata)
         # Force eval to prevent lazy graph accumulation across spec decode steps
-        mx.eval(batch.cache[0].offset, batch.cache[0].left_padding)
+        _c0 = _inner_cache(batch.cache[0])
+        mx.eval(_c0.offset, _c0.left_padding)
         logger.info("[SD-TP] step=%d POST-REJECT n_results=%d",
                     self._step_count, len(accept_results))
 
@@ -1227,11 +1240,13 @@ class Scheduler:
             batch_variable_trim(batch.cache, trim_array)
             # Materialize trim results before further cache operations
             if batch.cache:
-                mx.eval(batch.cache[0].offset, batch.cache[0].left_padding)
+                _c0 = _inner_cache(batch.cache[0])
+                mx.eval(_c0.offset, _c0.left_padding)
             # Recompute _idx after trim to prevent stale values
             from vllm_mlx.spec_decode.cache_utils import fixup_cache_after_filter
             fixup_cache_after_filter(batch.cache)
-            mx.eval(batch.cache[0].offset, batch.cache[0].left_padding)
+            _c0 = _inner_cache(batch.cache[0])
+            mx.eval(_c0.offset, _c0.left_padding)
 
         logger.debug(
             "[SpecDecode TP] step=%d post-trim: trim_amounts=%s, "
@@ -1301,7 +1316,10 @@ class Scheduler:
         if batch.cache:
             cache_tensors = []
             for c in batch.cache:
-                cache_tensors.extend([c.keys, c.values, c.offset, c.left_padding])
+                # CacheList wraps multiple sub-caches (e.g., deepseek_v32)
+                sub_caches = c.caches if hasattr(c, 'caches') else (c,)
+                for sc in sub_caches:
+                    cache_tensors.extend([sc.keys, sc.values, sc.offset, sc.left_padding])
             mx.eval(*cache_tensors)
 
         # Broadcast SpecDecodeResult to workers
@@ -1320,7 +1338,8 @@ class Scheduler:
             logger.info("[SD-TP] step=%d POST-BROADCAST done", self._step_count)
             # Ensure all pending lazy ops are resolved before next forward pass
             if batch.cache:
-                mx.eval(batch.cache[0].offset, batch.cache[0].left_padding)
+                _c0 = _inner_cache(batch.cache[0])
+                mx.eval(_c0.offset, _c0.left_padding)
 
         return responses
 
@@ -1566,7 +1585,8 @@ class Scheduler:
             batch_variable_trim(batch.cache, trim_array)
             # Materialize and fix _idx after trim
             if batch.cache:
-                mx.eval(batch.cache[0].offset, batch.cache[0].left_padding)
+                _c0 = _inner_cache(batch.cache[0])
+                mx.eval(_c0.offset, _c0.left_padding)
             from vllm_mlx.spec_decode.cache_utils import fixup_cache_after_filter
             fixup_cache_after_filter(batch.cache)
 

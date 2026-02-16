@@ -183,6 +183,8 @@ def patch_mlx_lm_for_mamba():
                 cache = BatchRotatingKVCache.merge([c[i] for c in caches])
             elif isinstance(caches[0][i], (OrigMambaCache, BatchMambaCache)):
                 cache = BatchMambaCache.merge([c[i] for c in caches])
+            elif isinstance(caches[0][i], CacheList):
+                cache = CacheList.merge([c[i] for c in caches])
             else:
                 raise ValueError(
                     f"{type(caches[0][i])} does not yet support batching with history"
