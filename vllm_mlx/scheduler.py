@@ -111,6 +111,8 @@ class SchedulerConfig:
     num_speculative_tokens: int = 3  # Number of draft tokens per step (k)
     spec_decode_disable_batch_size: Optional[int] = None  # Disable spec decode above this batch size
     draft_model_name: Optional[str] = None  # Draft model path (for future model-based proposers)
+    spec_decode_auto_disable_threshold: float = 0.4  # Auto-disable below this acceptance rate
+    spec_decode_auto_disable_window: int = 50  # Rolling window size for auto-disable evaluation
 
 
 @dataclass
@@ -714,6 +716,8 @@ class Scheduler:
             method=self.config.speculative_method,
             num_speculative_tokens=self.config.num_speculative_tokens,
             disable_by_batch_size=self.config.spec_decode_disable_batch_size,
+            auto_disable_threshold=self.config.spec_decode_auto_disable_threshold,
+            auto_disable_window=self.config.spec_decode_auto_disable_window,
         )
 
         # Create proposer based on method
@@ -2851,12 +2855,14 @@ class Scheduler:
         if self._spec_decode_runtime is not None:
             stats["spec_decode"] = {
                 "enabled": self._spec_decode_enabled,
+                "auto_disabled": self._spec_decode_runtime.auto_disabled,
                 "method": self.config.speculative_method,
                 "num_speculative_tokens": self.config.num_speculative_tokens,
                 "total_drafts": self._spec_decode_runtime.stats.num_drafts,
                 "total_draft_tokens": self._spec_decode_runtime.stats.num_draft_tokens,
                 "total_accepted": self._spec_decode_runtime.stats.num_accepted_tokens,
                 "acceptance_rate": self._spec_decode_runtime.stats.acceptance_rate(),
+                "recent_acceptance_rate": self._spec_decode_runtime.stats.recent_acceptance_rate(),
                 "mean_accepted_length": self._spec_decode_runtime.stats.mean_accepted_length(),
                 "per_position_acceptance": self._spec_decode_runtime.stats.acceptance_rate_per_position,
             }

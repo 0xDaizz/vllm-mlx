@@ -6,6 +6,7 @@ Tracks acceptance rates, draft counts, and per-position acceptance
 statistics to monitor speculation quality and guide tuning decisions.
 """
 
+from collections import deque
 from dataclasses import dataclass, field
 
 
@@ -35,6 +36,10 @@ class SpecDecodeStats:
     # Internal counters for per-position running averages
     _position_accepted_counts: list[int] = field(default_factory=list)
     _position_total_counts: list[int] = field(default_factory=list)
+
+    # Rolling window for recent acceptance rate tracking (auto-disable)
+    _recent_accepted: deque = field(default_factory=lambda: deque(maxlen=50))
+    _recent_total: deque = field(default_factory=lambda: deque(maxlen=50))
 
     def acceptance_rate(self) -> float:
         """
@@ -80,6 +85,10 @@ class SpecDecodeStats:
         self.num_draft_tokens += num_drafted
         self.num_accepted_tokens += num_accepted
 
+        # Append to rolling window for recent acceptance rate tracking
+        self._recent_accepted.append(num_accepted)
+        self._recent_total.append(num_drafted)
+
         # Expand per-position counters if needed
         while len(self._position_accepted_counts) < len(position_accepted):
             self._position_accepted_counts.append(0)
@@ -99,6 +108,48 @@ class SpecDecodeStats:
             for i in range(len(self._position_total_counts))
         ]
 
+    def set_window_size(self, window: int) -> None:
+        """Resize the rolling window for recent acceptance tracking.
+
+        Args:
+            window: Maximum number of recent rounds to keep.
+        """
+        self._recent_accepted = deque(self._recent_accepted, maxlen=window)
+        self._recent_total = deque(self._recent_total, maxlen=window)
+
+    def recent_acceptance_rate(self) -> float:
+        """Compute the acceptance rate over the recent rolling window.
+
+        Returns:
+            The fraction of recently drafted tokens that were accepted,
+            or 0.0 if the window is empty.
+        """
+        total = sum(self._recent_total)
+        if total == 0:
+            return 0.0
+        return sum(self._recent_accepted) / total
+
+    def should_auto_disable(self, threshold: float) -> bool:
+        """Check whether speculation should be auto-disabled.
+
+        Auto-disable triggers when the rolling window is full (enough data)
+        AND the recent acceptance rate falls below *threshold*.
+
+        Args:
+            threshold: Acceptance rate threshold. Values <= 0.0 effectively
+                disable this check.
+
+        Returns:
+            True if the acceptance rate is too low and speculation should
+            be temporarily disabled.
+        """
+        if threshold <= 0.0:
+            return False
+        if len(self._recent_total) < self._recent_total.maxlen:
+            # Not enough data yet
+            return False
+        return self.recent_acceptance_rate() < threshold
+
     def reset(self) -> None:
         """Reset all statistics to initial state."""
         self.num_drafts = 0
@@ -107,3 +158,5 @@ class SpecDecodeStats:
         self.acceptance_rate_per_position = []
         self._position_accepted_counts = []
         self._position_total_counts = []
+        self._recent_accepted.clear()
+        self._recent_total.clear()

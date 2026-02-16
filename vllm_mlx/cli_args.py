@@ -296,6 +296,24 @@ def add_speculative_decoding_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Path to draft model for speculative decoding (required with --speculative-method draft_model)",
     )
+    parser.add_argument(
+        "--spec-decode-auto-disable-threshold",
+        type=float,
+        default=0.4,
+        help=(
+            "Auto-disable speculative decoding when the recent acceptance rate "
+            "drops below this threshold (default: 0.4). Set to 0 to disable."
+        ),
+    )
+    parser.add_argument(
+        "--spec-decode-auto-disable-window",
+        type=int,
+        default=50,
+        help=(
+            "Number of recent speculation rounds over which to evaluate the "
+            "acceptance rate for auto-disable decisions (default: 50)."
+        ),
+    )
 
 
 def add_extra_server_args(parser: argparse.ArgumentParser) -> None:
@@ -430,6 +448,12 @@ def build_scheduler_config(args):
             args, "spec_decode_disable_batch_size", None
         ),
         draft_model_name=getattr(args, "draft_model", None),
+        spec_decode_auto_disable_threshold=getattr(
+            args, "spec_decode_auto_disable_threshold", 0.4
+        ),
+        spec_decode_auto_disable_window=getattr(
+            args, "spec_decode_auto_disable_window", 50
+        ),
     )
 
 
@@ -556,6 +580,8 @@ def rebuild_server_args_from_namespace(args) -> list[str]:
         ("rate_limit", "--rate-limit", 0),
         ("timeout", "--timeout", 300.0),
         ("num_speculative_tokens", "--num-speculative-tokens", 3),
+        ("spec_decode_auto_disable_threshold", "--spec-decode-auto-disable-threshold", 0.4),
+        ("spec_decode_auto_disable_window", "--spec-decode-auto-disable-window", 50),
     ]
     for attr, flag, default in _VALUED_ARGS:
         val = getattr(args, attr, default)

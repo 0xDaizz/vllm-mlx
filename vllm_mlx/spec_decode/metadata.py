@@ -16,7 +16,8 @@ class SpecDecodeConfig:
     Configuration for speculative decoding.
 
     Controls which speculation method to use, how many tokens to draft,
-    and when to automatically disable speculation for large batches.
+    and when to automatically disable speculation for large batches or
+    low acceptance rates.
 
     Attributes:
         method: Speculation method. One of "ngram", "eagle", or "draft_model".
@@ -24,11 +25,18 @@ class SpecDecodeConfig:
         disable_by_batch_size: If set, automatically disable speculative decoding
             when the batch size exceeds this threshold. This avoids wasting compute
             on drafting when the GPU is already saturated with real requests.
+        auto_disable_threshold: Acceptance rate threshold below which speculative
+            decoding is automatically disabled. Set to 0.0 to never auto-disable
+            based on acceptance rate. Default: 0.4.
+        auto_disable_window: Number of recent speculation rounds over which to
+            evaluate the acceptance rate for auto-disable decisions. Default: 50.
     """
 
     method: str
     num_speculative_tokens: int
     disable_by_batch_size: int | None = None
+    auto_disable_threshold: float = 0.4
+    auto_disable_window: int = 50
 
     def __post_init__(self) -> None:
         """Validate configuration values."""
@@ -44,6 +52,14 @@ class SpecDecodeConfig:
         if self.disable_by_batch_size is not None and self.disable_by_batch_size < 1:
             raise ValueError(
                 f"disable_by_batch_size must be >= 1, got {self.disable_by_batch_size}"
+            )
+        if not (0.0 <= self.auto_disable_threshold <= 1.0):
+            raise ValueError(
+                f"auto_disable_threshold must be in [0.0, 1.0], got {self.auto_disable_threshold}"
+            )
+        if self.auto_disable_window < 1:
+            raise ValueError(
+                f"auto_disable_window must be >= 1, got {self.auto_disable_window}"
             )
 
 

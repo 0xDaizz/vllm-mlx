@@ -77,45 +77,78 @@ class RejectionSampler:
         target_logits: mx.array,
         draft_token_ids: list[list[int]],
     ) -> RejectionResult:
-        """Greedy rejection using argmax matching."""
-        accepted_token_ids: list[list[int]] = []
-        num_accepted: list[int] = []
-        bonus_token_ids: list[int | None] = []
-
+        """Greedy rejection using vectorized argmax matching."""
         batch_size = len(draft_token_ids)
 
+        # Compute all argmax target tokens at once: shape (batch, k+1)
+        target_tokens = mx.argmax(target_logits, axis=-1)
+
+        # Find max draft length for padding
+        draft_lengths = [len(d) for d in draft_token_ids]
+        max_k = max(draft_lengths) if draft_lengths else 0
+
+        if max_k == 0:
+            # All requests have empty drafts — bonus is target_tokens[:, 0]
+            bonus_arr = target_tokens[:, 0]
+            mx.eval(bonus_arr)
+            bonus_list = bonus_arr.tolist()
+            return RejectionResult(
+                accepted_token_ids=[[] for _ in range(batch_size)],
+                num_accepted=[0] * batch_size,
+                bonus_token_ids=bonus_list,
+            )
+
+        # Build padded draft array: shape (batch, max_k)
+        # Use -1 as pad value (will never match any argmax token)
+        draft_padded = [
+            d + [-1] * (max_k - len(d)) for d in draft_token_ids
+        ]
+        draft_arr = mx.array(draft_padded)  # (batch, max_k)
+
+        # Compare: match[b, i] = (target_tokens[b, i] == draft_arr[b, i])
+        match_mask = target_tokens[:, :max_k] == draft_arr  # (batch, max_k)
+
+        # Mask out positions beyond each request's actual draft length
+        # Create a length mask: valid[b, i] = (i < draft_lengths[b])
+        positions = mx.arange(max_k)  # (max_k,)
+        length_arr = mx.array(draft_lengths)  # (batch,)
+        valid_mask = positions[None, :] < length_arr[:, None]  # (batch, max_k)
+
+        # Positions beyond draft length should not match (force False)
+        match_mask = match_mask & valid_mask
+
+        # Cumulative product to find first rejection point
+        # cumprod_mask[b, i] = 1 if all tokens 0..i matched, 0 otherwise
+        cumprod_mask = mx.cumprod(match_mask.astype(mx.int32), axis=1)
+
+        # Number accepted per request = sum of cumprod mask
+        num_accepted_arr = mx.sum(cumprod_mask, axis=1)  # (batch,)
+
+        # Bonus token: target_tokens[b, num_accepted[b]]
+        # Use gather indexing
+        bonus_indices = num_accepted_arr  # (batch,)
+        # target_tokens shape is (batch, k+1), index along axis=1
+        bonus_arr = mx.take_along_axis(
+            target_tokens, bonus_indices[:, None], axis=1
+        ).squeeze(1)  # (batch,)
+
+        # Single eval call for all results
+        mx.eval(target_tokens, num_accepted_arr, bonus_arr, cumprod_mask)
+
+        # Convert to Python lists
+        num_accepted_list = num_accepted_arr.tolist()
+        bonus_list = bonus_arr.tolist()
+
+        # Build accepted_token_ids from the draft tokens (they are known to match)
+        accepted_token_ids: list[list[int]] = []
         for b in range(batch_size):
-            request_draft = draft_token_ids[b]
-
-            if not request_draft:
-                bonus_token = int(mx.argmax(target_logits[b, 0, :]).item())
-                accepted_token_ids.append([])
-                num_accepted.append(0)
-                bonus_token_ids.append(bonus_token)
-                continue
-
-            accepted: list[int] = []
-            bonus_token: int | None = None
-
-            for i, token in enumerate(request_draft):
-                target_token = int(mx.argmax(target_logits[b, i, :]).item())
-                if target_token == token:
-                    accepted.append(token)
-                else:
-                    bonus_token = target_token
-                    break
-
-            if bonus_token is None:
-                bonus_token = int(mx.argmax(target_logits[b, len(request_draft), :]).item())
-
-            accepted_token_ids.append(accepted)
-            num_accepted.append(len(accepted))
-            bonus_token_ids.append(bonus_token)
+            n = num_accepted_list[b]
+            accepted_token_ids.append(draft_token_ids[b][:n])
 
         return RejectionResult(
             accepted_token_ids=accepted_token_ids,
-            num_accepted=num_accepted,
-            bonus_token_ids=bonus_token_ids,
+            num_accepted=num_accepted_list,
+            bonus_token_ids=bonus_list,
         )
 
     def _stochastic_rejection(
@@ -124,68 +157,117 @@ class RejectionSampler:
         draft_token_ids: list[list[int]],
         draft_logits: mx.array | None,
     ) -> RejectionResult:
-        """Stochastic rejection sampling with adjusted bonus distribution."""
+        """Stochastic rejection sampling with vectorized acceptance checks."""
         if draft_logits is None:
             raise ValueError("draft_logits must be provided for stochastic rejection.")
 
-        p_target = mx.softmax(target_logits, axis=-1)
-        p_draft = mx.softmax(draft_logits, axis=-1)
-
-        accepted_token_ids: list[list[int]] = []
-        num_accepted: list[int] = []
-        bonus_token_ids: list[int | None] = []
-
         batch_size = len(draft_token_ids)
-        eps = mx.array(1e-10)
+        draft_lengths = [len(d) for d in draft_token_ids]
+        max_k = max(draft_lengths) if draft_lengths else 0
+
+        # p_target covers k+1 positions, p_draft covers k positions
+        p_target = mx.softmax(target_logits, axis=-1)  # (batch, k+1, vocab)
+        p_draft = mx.softmax(draft_logits, axis=-1)    # (batch, k, vocab)
+
+        if max_k == 0:
+            # All requests have empty drafts — sample bonus from target
+            bonus_sampled = mx.random.categorical(target_logits[:, 0, :])  # (batch,)
+            mx.eval(bonus_sampled)
+            bonus_list = bonus_sampled.tolist()
+            return RejectionResult(
+                accepted_token_ids=[[] for _ in range(batch_size)],
+                num_accepted=[0] * batch_size,
+                bonus_token_ids=bonus_list,
+            )
+
+        eps = 1e-10
+
+        # Build padded draft token index array: shape (batch, max_k)
+        # Pad with 0 (a valid but irrelevant token index for masked positions)
+        draft_padded = [
+            d + [0] * (max_k - len(d)) for d in draft_token_ids
+        ]
+        draft_arr = mx.array(draft_padded)  # (batch, max_k)
+
+        # Gather target and draft probabilities at draft token positions
+        # p_target[:, :max_k, :] has shape (batch, max_k, vocab)
+        # We need p_target[b, i, draft_arr[b, i]] for each b, i
+        draft_idx_expanded = draft_arr[:, :, None]  # (batch, max_k, 1)
+        p_t_at_draft = mx.take_along_axis(
+            p_target[:, :max_k, :], draft_idx_expanded, axis=2
+        ).squeeze(2)  # (batch, max_k)
+        p_d_at_draft = mx.take_along_axis(
+            p_draft[:, :max_k, :], draft_idx_expanded, axis=2
+        ).squeeze(2)  # (batch, max_k)
+
+        # Safe division for acceptance ratio
+        p_d_safe = mx.maximum(p_d_at_draft, eps)
+        ratios = p_t_at_draft / p_d_safe  # (batch, max_k)
+
+        # Generate all random numbers at once
+        r = mx.random.uniform(shape=(batch_size, max_k))  # (batch, max_k)
+
+        # Accept where r < min(1, ratio)
+        accept_mask = r < mx.minimum(mx.array(1.0), ratios)  # (batch, max_k)
+
+        # Mask out positions beyond each request's draft length
+        positions = mx.arange(max_k)  # (max_k,)
+        length_arr = mx.array(draft_lengths)  # (batch,)
+        valid_mask = positions[None, :] < length_arr[:, None]  # (batch, max_k)
+        accept_mask = accept_mask & valid_mask
+
+        # Cumulative product to find first rejection
+        cumprod_mask = mx.cumprod(accept_mask.astype(mx.int32), axis=1)  # (batch, max_k)
+        num_accepted_arr = mx.sum(cumprod_mask, axis=1)  # (batch,)
+
+        # Evaluate everything needed before Python-side branching
+        mx.eval(num_accepted_arr, p_target, p_draft)
+        num_accepted_list = num_accepted_arr.tolist()
+
+        # Now compute bonus tokens per request
+        # For rejected requests: sample from adjusted distribution at rejection position
+        # For all-accepted requests: sample from target at position k
+        bonus_tokens: list[int] = []
+        # Collect all bonus sampling operations, then eval once
+        bonus_arrays: list[mx.array] = []
 
         for b in range(batch_size):
-            request_draft = draft_token_ids[b]
+            n = num_accepted_list[b]
+            k_b = draft_lengths[b]
 
-            if not request_draft:
-                sampled = mx.random.categorical(target_logits[b, 0, :])
-                bonus_token = int(sampled.item())
-                accepted_token_ids.append([])
-                num_accepted.append(0)
-                bonus_token_ids.append(bonus_token)
-                continue
-
-            accepted: list[int] = []
-            bonus_token: int | None = None
-
-            for i, token in enumerate(request_draft):
-                p_t = p_target[b, i, token]
-                p_d = p_draft[b, i, token]
-                p_d_safe = mx.maximum(p_d, eps)
-
-                ratio = float((p_t / p_d_safe).item())
-                r = float(mx.random.uniform().item())
-
-                if ratio >= r:
-                    accepted.append(token)
-                    continue
-
-                adjusted = mx.maximum(p_target[b, i, :] - p_draft[b, i, :], 0.0)
+            if n == k_b:
+                # All draft tokens accepted — sample bonus from target at pos k
+                bonus_arrays.append(
+                    mx.random.categorical(target_logits[b, k_b, :])
+                )
+            else:
+                # Rejected at position n — sample from adjusted distribution
+                adjusted = mx.maximum(
+                    p_target[b, n, :] - p_draft[b, n, :], 0.0
+                )
                 adjusted_sum = mx.sum(adjusted)
+                # Use adjusted if sum > 0, else fall back to target probs
+                adjusted_normalized = mx.where(
+                    adjusted_sum > 0.0,
+                    adjusted / mx.maximum(adjusted_sum, eps),
+                    p_target[b, n, :],
+                )
+                bonus_arrays.append(
+                    mx.random.categorical(mx.log(adjusted_normalized))
+                )
 
-                if float(adjusted_sum.item()) > 0.0:
-                    adjusted_normalized = adjusted / adjusted_sum
-                else:
-                    adjusted_normalized = p_target[b, i, :]
+        # Single eval for all bonus token samples
+        mx.eval(*bonus_arrays)
+        bonus_list = [int(a.item()) for a in bonus_arrays]
 
-                sampled = mx.random.categorical(mx.log(adjusted_normalized))
-                bonus_token = int(sampled.item())
-                break
-
-            if bonus_token is None:
-                sampled = mx.random.categorical(target_logits[b, len(request_draft), :])
-                bonus_token = int(sampled.item())
-
-            accepted_token_ids.append(accepted)
-            num_accepted.append(len(accepted))
-            bonus_token_ids.append(bonus_token)
+        # Build accepted_token_ids
+        accepted_token_ids: list[list[int]] = []
+        for b in range(batch_size):
+            n = num_accepted_list[b]
+            accepted_token_ids.append(draft_token_ids[b][:n])
 
         return RejectionResult(
             accepted_token_ids=accepted_token_ids,
-            num_accepted=num_accepted,
-            bonus_token_ids=bonus_token_ids,
+            num_accepted=num_accepted_list,
+            bonus_token_ids=bonus_list,
         )

@@ -182,7 +182,10 @@ class SimpleEngine(BaseEngine):
 
         async with self._generation_lock:
             accumulated_text = ""
-            prompt_tokens = 0
+            if hasattr(self._model, "tokenizer") and hasattr(self._model.tokenizer, "encode"):
+                prompt_tokens = len(self._model.tokenizer.encode(prompt))
+            else:
+                prompt_tokens = 0
             completion_tokens = 0
             finished = False
 
@@ -223,8 +226,6 @@ class SimpleEngine(BaseEngine):
                     break
 
             if not finished:
-                if prompt_tokens == 0:
-                    prompt_tokens = len(self._model.tokenizer.encode(prompt))
                 yield GenerationOutput(
                     text=accumulated_text,
                     new_text="",

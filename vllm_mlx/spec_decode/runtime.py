@@ -150,6 +150,13 @@ class SpecDecodeRuntime:
 
         # Statistics tracker
         self._stats = SpecDecodeStats()
+        # Set the rolling window size from config
+        self._stats.set_window_size(config.auto_disable_window)
+
+        # Auto-disable state
+        self._auto_disabled: bool = False
+        self._steps_since_disable: int = 0
+        self._auto_disable_logged: bool = False
 
     # ------------------------------------------------------------------
     # Public API
@@ -166,13 +173,54 @@ class SpecDecodeRuntime:
         ``config.num_speculative_tokens`` draft tokens based on the request's
         current token sequence.
 
+        If the recent acceptance rate has dropped below the configured
+        threshold, speculation is temporarily auto-disabled.  Every
+        ``auto_disable_window`` steps after disabling, a single probe round
+        is executed to check whether conditions have improved.
+
         Args:
             request_states: Mapping of request_id -> RequestState containing
                 the full token sequence and batch UID per request.
 
         Returns:
             SpecDecodeMetadata populated with draft tokens per request.
+            Returns empty metadata when auto-disabled (no drafts proposed).
         """
+        # --- Auto-disable based on acceptance rate feedback ---
+        threshold = self.config.auto_disable_threshold
+        window = self.config.auto_disable_window
+
+        if self._auto_disabled:
+            self._steps_since_disable += 1
+            # Periodic re-evaluation: try one probe round
+            if self._steps_since_disable >= window:
+                self._steps_since_disable = 0
+                # Allow this round to proceed as a probe
+                logger.info(
+                    "Spec decode auto-disable: running probe round to re-evaluate "
+                    "(recent acceptance rate=%.3f, threshold=%.3f)",
+                    self._stats.recent_acceptance_rate(),
+                    threshold,
+                )
+            else:
+                # Still disabled — return empty metadata
+                return SpecDecodeMetadata()
+        elif threshold > 0.0 and self._stats.should_auto_disable(threshold):
+            # Transition to disabled state
+            self._auto_disabled = True
+            self._steps_since_disable = 0
+            if not self._auto_disable_logged:
+                logger.info(
+                    "Spec decode auto-disabled: recent acceptance rate %.3f "
+                    "below threshold %.3f (window=%d). Will probe every %d steps.",
+                    self._stats.recent_acceptance_rate(),
+                    threshold,
+                    window,
+                    window,
+                )
+                self._auto_disable_logged = True
+            return SpecDecodeMetadata()
+
         metadata = SpecDecodeMetadata()
         k = self.config.num_speculative_tokens
 
@@ -342,6 +390,9 @@ class SpecDecodeRuntime:
                 position_accepted=position_accepted,
             )
 
+        # Check if we should re-enable after a probe round
+        self._check_auto_reenable()
+
         return results
 
     def rollback(
@@ -401,9 +452,36 @@ class SpecDecodeRuntime:
         """Return the accumulated speculative decoding statistics."""
         return self._stats
 
+    @property
+    def auto_disabled(self) -> bool:
+        """Whether speculative decoding is currently auto-disabled."""
+        return self._auto_disabled
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _check_auto_reenable(self) -> None:
+        """Re-enable speculation if a probe round shows improved acceptance.
+
+        Called after ``accept_and_commit`` updates statistics.  If the
+        runtime was auto-disabled and the most recent acceptance rate now
+        meets the threshold, speculation is re-enabled.
+        """
+        if not self._auto_disabled:
+            return
+        threshold = self.config.auto_disable_threshold
+        rate = self._stats.recent_acceptance_rate()
+        if rate >= threshold:
+            self._auto_disabled = False
+            self._steps_since_disable = 0
+            self._auto_disable_logged = False
+            logger.info(
+                "Spec decode re-enabled: recent acceptance rate %.3f "
+                ">= threshold %.3f",
+                rate,
+                threshold,
+            )
 
     def get_seq_len(self, request_id: str) -> int | None:
         """
