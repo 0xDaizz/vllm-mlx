@@ -20,7 +20,7 @@ class SpecDecodeConfig:
     low acceptance rates.
 
     Attributes:
-        method: Speculation method. One of "ngram", "eagle", or "draft_model".
+        method: Speculation method. One of "ngram", "eagle", "draft_model", or "mtp".
         num_speculative_tokens: Number of draft tokens to propose per step (k).
         disable_by_batch_size: If set, automatically disable speculative decoding
             when the batch size exceeds this threshold. This avoids wasting compute
@@ -40,7 +40,7 @@ class SpecDecodeConfig:
 
     def __post_init__(self) -> None:
         """Validate configuration values."""
-        valid_methods = {"ngram", "eagle", "draft_model"}
+        valid_methods = {"ngram", "eagle", "draft_model", "mtp"}
         if self.method not in valid_methods:
             raise ValueError(
                 f"Invalid method '{self.method}'. Must be one of {valid_methods}"

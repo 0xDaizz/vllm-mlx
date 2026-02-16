@@ -113,6 +113,8 @@ class SchedulerConfig:
     draft_model_name: Optional[str] = None  # Draft model path (for future model-based proposers)
     spec_decode_auto_disable_threshold: float = 0.4  # Auto-disable below this acceptance rate
     spec_decode_auto_disable_window: int = 50  # Rolling window size for auto-disable evaluation
+    model_name: Optional[str] = None  # Model name/path for MTP weight loading
+    mtp_model_name: Optional[str] = None  # Separate model for MTP weights (if different from main)
 
 
 @dataclass
@@ -504,6 +506,81 @@ def _install_chunked_prefill(
     logger.info(f"[chunked_prefill] installed with budget={budget} tokens per step")
 
 
+def _resolve_mtp_model_path(model_name: str, num_hidden_layers: int) -> str:
+    """Resolve an HF model name to a local path, downloading only MTP-related shards.
+
+    Instead of downloading the entire model (which can be 600GB+), this
+    downloads only the safetensors index and the specific shard files that
+    contain MTP layer weights.
+
+    Args:
+        model_name: HuggingFace model name (e.g. 'deepseek-ai/DeepSeek-V3-0324').
+        num_hidden_layers: Number of hidden layers in the main model.
+
+    Returns:
+        Local directory path containing the downloaded MTP weight files.
+    """
+    import json
+    from huggingface_hub import hf_hub_download
+
+    # Known MTP prefix patterns
+    mtp_prefixes = [
+        f"model.layers.{num_hidden_layers}.",   # DeepSeek V3/V3.2, GLM
+        "model.mtp_layers.",                     # MiMo
+        "model.mtp.",                            # Kimi, MiMo V2
+    ]
+
+    # Step 1: Download the safetensors index
+    try:
+        index_path = hf_hub_download(model_name, "model.safetensors.index.json")
+    except Exception:
+        # No index file — try downloading entire model as fallback
+        logger.warning(
+            "No safetensors index found for '%s', falling back to snapshot_download",
+            model_name,
+        )
+        from huggingface_hub import snapshot_download
+        return snapshot_download(model_name)
+
+    with open(index_path) as f:
+        index = json.load(f)
+
+    weight_map = index.get("weight_map", {})
+
+    # Step 2: Find shard files containing MTP weights (try all known prefixes)
+    mtp_files: set[str] = set()
+    for prefix in mtp_prefixes:
+        for key, filename in weight_map.items():
+            if key.startswith(prefix):
+                mtp_files.add(filename)
+        if mtp_files:
+            break
+
+    if not mtp_files:
+        raise ValueError(
+            f"No MTP weights found in {model_name}'s weight map. "
+            f"Tried prefixes: {mtp_prefixes}. "
+            f"This model may not have MTP layers."
+        )
+
+    logger.info(
+        "MTP weights span %d shard files out of %d total — downloading selectively",
+        len(mtp_files),
+        len(set(weight_map.values())),
+    )
+
+    # Step 3: Download only the needed shard files
+    for filename in sorted(mtp_files):
+        logger.info("Downloading MTP shard: %s", filename)
+        hf_hub_download(model_name, filename)
+
+    # Return the directory containing the downloaded files
+    # hf_hub_download caches to the same directory structure
+    from pathlib import Path
+    cache_dir = Path(index_path).parent
+    return str(cache_dir)
+
+
 class Scheduler:
     """
     Scheduler for continuous batching using mlx-lm BatchGenerator.
@@ -557,6 +634,7 @@ class Scheduler:
         # which references self._tp_world_size)
         self._communicator = None  # Set externally for distributed mode
         self._tp_world_size = 1
+        self._mtp_hidden_states: dict[str, Any] = {}  # Per-request hidden states for MTP
         self._pending_distributed_removes: Set[str] = set()  # Finished/aborted IDs to send to workers
 
         # Prefix cache for KV state reuse
@@ -757,6 +835,68 @@ class Scheduler:
             )
             proposer = DraftModelProposer(proposer_config)
             proposer.load()
+        elif self.config.speculative_method == "mtp":
+            from .spec_decode.mtp_module import load_mtp_weights, detect_mtp_prefix, detect_mtp_style
+            from .spec_decode.mtp_proposer import MTPProposer, MTPProposerConfig
+
+            model_config = self.model.args
+
+            # Resolve MTP weight source
+            mtp_source = self.config.mtp_model_name or self.config.model_name
+            if not mtp_source:
+                raise ValueError(
+                    "model_name or mtp_model_name must be set in SchedulerConfig "
+                    "for MTP weight loading"
+                )
+            import os
+            if os.path.isdir(mtp_source):
+                mtp_model_path = mtp_source
+            else:
+                mtp_model_path = _resolve_mtp_model_path(
+                    mtp_source, model_config.num_hidden_layers
+                )
+
+            # Auto-detect MTP prefix and style from weights
+            mtp_prefix, mtp_keys = detect_mtp_prefix(
+                mtp_model_path, model_config.num_hidden_layers
+            )
+            mtp_style = detect_mtp_style(mtp_keys, mtp_prefix)
+            logger.info(
+                "Detected MTP style='%s' with prefix='%s'",
+                mtp_style, mtp_prefix,
+            )
+
+            # Get decoder layer class from the loaded model
+            decoder_layer_cls = type(self.model.model.layers[0])
+
+            # Create appropriate MTP module based on detected style
+            if mtp_style == "standard":
+                from .spec_decode.mtp_adapters import StandardMTPModule
+                mtp_module = StandardMTPModule.from_model_config(
+                    model_config, decoder_layer_cls=decoder_layer_cls,
+                )
+            else:
+                from .spec_decode.mtp_adapters import SimpleMTPModule
+                mtp_module = SimpleMTPModule.from_model_config(
+                    model_config, decoder_layer_cls=decoder_layer_cls,
+                )
+
+            # Load MTP weights
+            load_mtp_weights(
+                mtp_model_path, model_config.num_hidden_layers, mtp_module,
+                model_config=model_config, mtp_prefix=mtp_prefix,
+            )
+
+            # Create proposer with shared embed_fn and lm_head
+            proposer_config = MTPProposerConfig(
+                num_speculative_tokens=self.config.num_speculative_tokens,
+            )
+            proposer = MTPProposer(
+                config=proposer_config,
+                mtp_module=mtp_module,
+                embed_fn=self.model.model.embed_tokens,
+                lm_head=self.model.lm_head,
+            )
         else:
             raise ValueError(
                 f"Unknown speculative method: {self.config.speculative_method}"
@@ -1224,6 +1364,7 @@ class Scheduler:
                 request_id=request_id,
                 token_ids=token_ids,
                 batch_uid=uid,
+                hidden_states=self._mtp_hidden_states.get(request_id),
             )
             uid_to_request_id_local[uid] = request_id
 
@@ -1258,8 +1399,9 @@ class Scheduler:
             draft_per_request[rid] = drafts
             max_draft_len = max(max_draft_len, len(drafts))
 
-        if max_draft_len == 0:
+        if max_draft_len == 0 and self.config.speculative_method != "mtp":
             # No drafts generated -- fall back to normal step
+            # (MTP continues to capture hidden states for bootstrap)
             return None  # Signal caller to use normal path
 
         input_rows = []
@@ -1278,7 +1420,14 @@ class Scheduler:
         # 4. Run target model forward pass
         # Feed the full [y, d1, ..., dk] sequence through the model with
         # the existing KV cache. The model returns logits for each position.
-        logits = self.model(input_tokens, cache=batch.cache)
+        _is_mtp = self.config.speculative_method == "mtp"
+        if _is_mtp:
+            # Capture hidden states for MTP: run backbone and lm_head separately
+            hidden_states = self.model.model(input_tokens, cache=batch.cache)
+            logits = self.model.lm_head(hidden_states)
+        else:
+            logits = self.model(input_tokens, cache=batch.cache)
+            hidden_states = None
         # logits shape: (B_spec, max_k+1, vocab_size)
 
         mx.eval(logits)
@@ -1297,6 +1446,16 @@ class Scheduler:
 
         # 6. Run rejection sampling
         accept_results = runtime.accept_and_commit(verify_result, draft_metadata)
+
+        # 6a. Store hidden states for MTP (at accepted positions)
+        if _is_mtp and hidden_states is not None:
+            for i, rid in enumerate(batch_request_ids):
+                result = accept_results.get(rid)
+                if result is not None:
+                    # The accepted position index in the logits/hidden tensor
+                    accepted_pos = result.num_accepted
+                    # Extract hidden state at the accepted position (shape: 1, 1, hidden_size)
+                    self._mtp_hidden_states[rid] = hidden_states[i : i + 1, accepted_pos : accepted_pos + 1, :]
 
         # Log spec decode stats periodically
         if runtime.stats.num_drafts % 50 == 0 and runtime.stats.num_drafts > 0:
@@ -2075,6 +2234,11 @@ class Scheduler:
             request.set_finished(RequestStatus.FINISHED_ABORTED)
         self.finished_req_ids.add(request_id)
 
+        # Clean up spec decode / MTP state
+        if self._spec_decode_runtime is not None:
+            self._spec_decode_runtime.remove_request(request_id)
+        self._mtp_hidden_states.pop(request_id, None)
+
         if self._communicator is not None and self._communicator.is_distributed:
             self._pending_distributed_removes.add(request_id)
 
@@ -2461,6 +2625,7 @@ class Scheduler:
             # Clean up spec decode state
             if self._spec_decode_runtime is not None:
                 self._spec_decode_runtime.remove_request(request_id)
+            self._mtp_hidden_states.pop(request_id, None)
 
             # Track as finished
             self.finished_req_ids.add(request_id)
@@ -2492,6 +2657,10 @@ class Scheduler:
         self.request_id_to_uid.clear()
         self.uid_to_request_id.clear()
 
+        # Clear MTP hidden states to prevent stale state after recovery
+        if hasattr(self, '_mtp_hidden_states') and self._mtp_hidden_states:
+            self._mtp_hidden_states.clear()
+
         logger.info("Cache recovery completed")
 
     def _reschedule_running_requests(self) -> None:
@@ -2508,6 +2677,10 @@ class Scheduler:
             # Move to waiting queue (at front for priority)
             self.waiting.appendleft(request)
             del self.running[request_id]
+
+        # Clear MTP hidden states - rescheduled requests will recompute from scratch
+        if hasattr(self, '_mtp_hidden_states') and self._mtp_hidden_states:
+            self._mtp_hidden_states.clear()
 
         if count > 0:
             logger.info(f"Rescheduled {count} requests for retry")
@@ -2723,6 +2896,12 @@ class Scheduler:
                                 output.has_work = True
                                 self._broadcast_sampled_tokens(responses)
                                 if responses:
+                                    # Invalidate stale MTP hidden states after normal decode
+                                    if self._mtp_hidden_states and self.config.speculative_method == "mtp":
+                                        for resp in responses:
+                                            rid = self.uid_to_request_id.get(resp.uid)
+                                            if rid:
+                                                self._mtp_hidden_states.pop(rid, None)
                                     outputs, finished_ids = (
                                         self._process_batch_responses(responses)
                                     )
@@ -2748,6 +2927,12 @@ class Scheduler:
                             output.has_work = True
                             self._broadcast_sampled_tokens(responses)
                             if responses:
+                                # Invalidate stale MTP hidden states after normal decode
+                                if self._mtp_hidden_states and self.config.speculative_method == "mtp":
+                                    for resp in responses:
+                                        rid = self.uid_to_request_id.get(resp.uid)
+                                        if rid:
+                                            self._mtp_hidden_states.pop(rid, None)
                                 outputs, finished_ids = (
                                     self._process_batch_responses(responses)
                                 )
@@ -2759,6 +2944,12 @@ class Scheduler:
                         output.has_work = True
                         self._broadcast_sampled_tokens(responses)
                         if responses:
+                            # Invalidate stale MTP hidden states after normal decode
+                            if self._mtp_hidden_states and self.config.speculative_method == "mtp":
+                                for resp in responses:
+                                    rid = self.uid_to_request_id.get(resp.uid)
+                                    if rid:
+                                        self._mtp_hidden_states.pop(rid, None)
                             outputs, finished_ids = (
                                 self._process_batch_responses(responses)
                             )

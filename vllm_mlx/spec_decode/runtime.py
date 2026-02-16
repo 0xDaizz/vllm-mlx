@@ -27,7 +27,7 @@ import mlx.core as mx
 
 from .metadata import SpecDecodeConfig, SpecDecodeMetadata
 from .metrics import SpecDecodeStats
-from .proposer import BaseProposer
+from .proposer import BaseProposer, ProposalContext
 
 if TYPE_CHECKING:
     from .rejection_sampler import RejectionResult, RejectionSampler
@@ -54,6 +54,7 @@ class RequestState:
     request_id: str
     token_ids: list[int]
     batch_uid: int
+    hidden_states: Any | None = None
 
 
 @dataclass
@@ -226,7 +227,14 @@ class SpecDecodeRuntime:
 
         for request_id, state in request_states.items():
             self.proposer.reset()
-            draft_tokens = self.proposer.propose(state.token_ids, k)
+            ctx = ProposalContext(
+                request_id=request_id,
+                token_ids=state.token_ids,
+                k=k,
+                hidden_states=state.hidden_states,
+            )
+            proposal = self.proposer.propose_with_context(ctx)
+            draft_tokens = proposal.token_ids
             metadata.add_request(request_id, draft_tokens)
 
             # Track current sequence length for later rollback calculations
@@ -503,3 +511,5 @@ class SpecDecodeRuntime:
             request_id: The request ID to remove.
         """
         self._seq_lens.pop(request_id, None)
+        if hasattr(self.proposer, 'remove_request'):
+            self.proposer.remove_request(request_id)

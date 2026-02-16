@@ -12,6 +12,7 @@ The propose() method works per-request (single sequence). The caller
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import Any
 
 
 @dataclass
@@ -27,6 +28,34 @@ class ProposerConfig:
     """
 
     num_speculative_tokens: int = 5
+
+
+@dataclass
+class ProposalContext:
+    """Context for propose_with_context(), carrying hidden states for MTP.
+
+    Attributes:
+        request_id: Unique request identifier.
+        token_ids: Full token sequence (prompt + generated so far).
+        k: Number of draft tokens to propose.
+        hidden_states: Last-layer hidden states from target model (for MTP).
+    """
+
+    request_id: str
+    token_ids: list[int]
+    k: int
+    hidden_states: Any | None = None
+
+
+@dataclass
+class Proposal:
+    """Result of a proposal, wrapping draft token IDs.
+
+    Attributes:
+        token_ids: Proposed draft token IDs.
+    """
+
+    token_ids: list[int]
 
 
 class BaseProposer(ABC):
@@ -65,6 +94,21 @@ class BaseProposer(ABC):
             proposer cannot generate enough candidates (e.g., n-gram miss).
         """
         ...
+
+    def propose_with_context(self, ctx: ProposalContext) -> Proposal:
+        """Propose draft tokens using rich context (default: delegates to propose()).
+
+        Subclasses that need hidden states (e.g., MTP) should override this.
+        The default implementation ignores extra context fields and calls propose().
+
+        Args:
+            ctx: ProposalContext with token_ids, k, and optional hidden_states.
+
+        Returns:
+            Proposal containing the draft token IDs.
+        """
+        tokens = self.propose(ctx.token_ids, ctx.k)
+        return Proposal(token_ids=tokens)
 
     @abstractmethod
     def reset(self) -> None:

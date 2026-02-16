@@ -29,6 +29,7 @@ vllm-mlx brings native Apple Silicon GPU acceleration to vLLM by integrating:
 - **MCP Tool Calling** - integrate external tools via Model Context Protocol
 - **Paged KV Cache** - memory-efficient caching with prefix sharing
 - **Continuous Batching** - high throughput for multiple concurrent users
+- **Speculative Decoding** - n-gram, draft model, and MTP (Multi-Token Prediction) methods
 - **Distributed Inference** - Tensor parallelism across multiple Mac Studios via Thunderbolt 5 RDMA
 
 ## Quick Start
@@ -388,9 +389,11 @@ GEMMA3_SLIDING_WINDOW=0 vllm-mlx serve mlx-community/gemma-3-27b-it-4bit --port 
 
 ### Speculative Decoding
 
-- **Single node**: n-gram speculative decoding works correctly on a single Mac Studio. Verified on M4 Ultra 512GB with Moonlight-16B model, up to k=5 draft tokens.
-- **Distributed TP (k≥2 deadlock)**: When running n-gram speculative decoding with k≥2 draft tokens across 2 nodes via Tensor Parallel, a deterministic deadlock occurs inside model forward (`all_sum`). Both ranks hang at `cache_idx=242` with matching state — not a protocol desync issue. k=1 works fine. Root cause under investigation. See [Bug Report](docs/spec_decode_tp_bugs.md) for details.
-- **TP output quality**: Distributed TP inference may produce lower quality output compared to single-node inference, possibly due to bfloat16 precision accumulation across 61 layers of `all_sum` operations. Under investigation.
+- **Single node**: n-gram speculative decoding works correctly (verified up to k=5).
+- **MTP (Multi-Token Prediction)**: Self-speculative decoding using the model's built-in MTP weights. Supports DeepSeek V3/V3.2 and GLM-5 model families. Requires the original HuggingFace checkpoint (not quantized MLX conversions). See [MTP Guide](docs/mtp_speculative_decoding.md).
+- **Distributed TP (k≥2 deadlock)**: n-gram spec decode with k≥2 across TP nodes causes deterministic deadlock. k=1 works. See [Bug Report](docs/spec_decode_tp_bugs.md).
+- **MTP + TP**: Not yet supported. MTP currently works on single node only.
+- **TP output quality**: May produce lower quality output due to bfloat16 precision accumulation. Under investigation.
 
 ## Contributing
 

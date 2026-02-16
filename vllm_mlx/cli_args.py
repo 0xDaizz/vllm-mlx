@@ -275,7 +275,7 @@ def add_speculative_decoding_args(parser: argparse.ArgumentParser) -> None:
         "--speculative-method",
         type=str,
         default=None,
-        choices=["ngram", "draft_model"],
+        choices=["ngram", "draft_model", "mtp"],
         help="Speculative decoding method (default: disabled)",
     )
     parser.add_argument(
@@ -295,6 +295,17 @@ def add_speculative_decoding_args(parser: argparse.ArgumentParser) -> None:
         type=str,
         default=None,
         help="Path to draft model for speculative decoding (required with --speculative-method draft_model)",
+    )
+    parser.add_argument(
+        "--mtp-model",
+        type=str,
+        default=None,
+        help=(
+            "Model to load MTP weights from (default: same as main model). "
+            "Use this to load MTP weights from the original HuggingFace "
+            "checkpoint when the main model is a quantized MLX conversion "
+            "that doesn't include MTP weights."
+        ),
     )
     parser.add_argument(
         "--spec-decode-auto-disable-threshold",
@@ -454,6 +465,8 @@ def build_scheduler_config(args):
         spec_decode_auto_disable_window=getattr(
             args, "spec_decode_auto_disable_window", 50
         ),
+        model_name=getattr(args, "model", None),
+        mtp_model_name=getattr(args, "mtp_model", None),
     )
 
 
@@ -597,6 +610,7 @@ def rebuild_server_args_from_namespace(args) -> list[str]:
         ("speculative_method", "--speculative-method"),
         ("spec_decode_disable_batch_size", "--spec-decode-disable-batch-size"),
         ("draft_model", "--draft-model"),
+        ("mtp_model", "--mtp-model"),
         ("mcp_config", "--mcp-config"),
         ("embedding_model", "--embedding-model"),
         ("default_temperature", "--default-temperature"),
