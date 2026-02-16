@@ -236,11 +236,16 @@ class MLXLanguageModel:
         # Create sampler with parameters
         sampler = self._create_sampler(temperature, top_p)
 
+        # Pre-encode prompt to avoid mlx_lm's add_special_tokens=True
+        # which crashes some tokenizers (e.g., Moonlight)
+        import mlx.core as mx
+        prompt_tokens = mx.array(self.tokenizer.encode(prompt))
+
         # Generate text
         output_text = generate(
             self.model,
             self.tokenizer,
-            prompt=prompt,
+            prompt=prompt_tokens,
             max_tokens=max_tokens,
             sampler=sampler,
             verbose=False,
@@ -289,13 +294,19 @@ class MLXLanguageModel:
         # Create sampler with parameters
         sampler = self._create_sampler(temperature, top_p)
 
+        # Pre-encode prompt to avoid mlx_lm's add_special_tokens=True
+        # which crashes some tokenizers (e.g., Moonlight)
+        import mlx.core as mx
+        prompt_tokens = mx.array(self.tokenizer.encode(prompt))
+        prompt_token_count = prompt_tokens.shape[0]
+
         token_count = 0
         accumulated_text = ""
 
         for response in stream_generate(
             self.model,
             self.tokenizer,
-            prompt=prompt,
+            prompt=prompt_tokens,
             max_tokens=max_tokens,
             sampler=sampler,
         ):
