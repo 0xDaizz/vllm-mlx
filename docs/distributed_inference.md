@@ -642,12 +642,33 @@ After rebooting either machine:
 | Limitation | Details |
 |------------|---------|
 | **Prefix cache disabled** | Prefix caching is automatically disabled in distributed mode. Workers cannot share KV cache state across the RDMA link. Each request starts with a full prefill. |
-| **Speculative decoding** | Speculative decoding in distributed mode is experimental. The n-gram proposer is supported; EAGLE/draft-model proposers are not yet available in TP mode. |
+| **Speculative decoding** | Speculative decoding in distributed mode is experimental. The n-gram proposer is supported with sampling synchronization fix (commit `d11cd16`); EAGLE/draft-model proposers are not yet available in TP mode. |
 | **Tensor parallelism only** | Only tensor parallelism (TP) is supported. Pipeline parallelism (PP) is not implemented. |
 | **Fully connected mesh** | JACCL requires every node to be directly cabled to every other node. For 2 nodes, this means 1 cable. For 3+ nodes, the cabling requirement grows quadratically. |
 | **Maximum cluster size** | Practical limit of ~4 nodes due to Thunderbolt port count on Mac Studio (3 usable TB5 ports; each node needs N-1 ports for N nodes in a full mesh). |
 | **No hot-add/remove** | Nodes cannot be added or removed while the server is running. The cluster topology is fixed at startup. |
 | **Text models only** | Distributed inference currently supports text LLM models. Vision-language (mlx-vlm) and audio models are not yet supported in TP mode. |
+| **Output quality in TP mode** | TP 모드에서 256+ 출력 토큰 시 품질 저하가 관찰됩니다. 양 Rank가 동일한 토큰을 생성하지만 (샘플링 동기화 확인됨), 출력 품질 자체가 단일 노드 대비 저하될 수 있습니다. bfloat16 all_sum 정밀도 누적이 의심 원인입니다. 조사 진행 중. |
+
+---
+
+## Known Issues
+
+### TP Output Quality Degradation (Under Investigation)
+
+When running large MoE models (e.g., Kimi K2.5) in TP mode, output quality may degrade after approximately 256 output tokens. Symptoms include word repetition, incoherent text, and eventual output collapse.
+
+**What we've verified:**
+- Both ranks produce identical tokens at every step (0 MISMATCH across 256 steps)
+- MoE routing is identical on all ranks (experts sharded by hidden dimension, not by expert index)
+- The sampling synchronization fix (`_synced_step` monkey-patch) is working correctly
+
+**Suspected causes:**
+- bfloat16 precision accumulation across 61 layers per step
+- MLA (Multi-head Latent Attention) sensitivity to TP weight splitting
+- Interaction between int4 quantization and TP sharding
+
+This issue is being actively investigated. For updates, see `docs/spec_decode_tp_bugs.md` (Bug 6).
 
 ---
 

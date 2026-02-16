@@ -3,7 +3,7 @@
 > TB5 + JACCL + RDMA 기반 Tensor Parallelism + Speculative Decoding
 >
 > 생성일: 2026-02-14
-> 상태: Phase 0-4b 구현 완료, Phase 5 (TP+Spec Decode 통합) 구현 완료
+> 상태: Phase 0-5 구현 완료. TP 샘플링 동기화 수정 (d11cd16). TP 출력 품질 저하 조사 중.
 
 ---
 
@@ -157,6 +157,8 @@
   - [x] `mx.distributed.broadcast()` 또는 커스텀 broadcast로 token ID 전파
   - [x] 모든 rank에서 동일 token ID 확인
 - [ ] 대안: 동일 seed 기반 독립 샘플링 (향후 최적화용) → Phase 6으로 이관
+
+> **Note (2026-02-16)**: 최종 구현은 `dist_group` 직접 전달 대신 `_synced_step` 몽키패치 방식 채택 (커밋 `d11cd16`). 진단 결과 256 스텝에서 0 MISMATCH 확인. 단, TP 모드 출력 품질 저하는 별도 이슈로 조사 중 (버그 6).
 
 #### Engine Core 분산 모드
 
@@ -520,8 +522,8 @@
 
 #### 문서화
 
-- [ ] 분산 추론 설정 가이드 (hostfile, RDMA 설정)
-- [ ] API 사용 예시 (--distributed, --speculative-method)
+- [x] 분산 추론 설정 가이드 (hostfile, RDMA 설정) → `docs/distributed_inference.md`
+- [x] API 사용 예시 (--distributed, --speculative-method) → `docs/distributed_inference.md`
 - [ ] 성능 튜닝 가이드 (TP degree, spec tokens 수, batch size threshold)
 - [ ] 트러블슈팅 가이드 (RDMA 연결 실패, rank 동기화 문제)
 
@@ -597,6 +599,7 @@ Phase 0 ──> Phase 1 ──> Phase 2 ──> Phase 3 ──┐
 | `vllm_mlx/models/llm.py` | 1 | sharded_load() |
 | `vllm_mlx/model_runner.py` | 1 | sharded model 지원 |
 | `vllm_mlx/scheduler.py` | 2, 3, 4b | StepPlan, 캐시 해시, spec decode |
+| `scheduler.py`, `distributed_launcher.py` | 2 | _synced_step 몽키패치 (분산 샘플링 동기화, 커밋 d11cd16) |
 | `vllm_mlx/engine_core.py` | 2, 4b | 분산 루프, spec decode 모드 |
 | `vllm_mlx/memory_cache.py` | 3 | head-sharded 캐시 |
 | `vllm_mlx/paged_cache.py` | 3 | block table 동기화 |

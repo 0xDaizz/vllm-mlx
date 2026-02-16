@@ -29,6 +29,7 @@ vllm-mlx brings native Apple Silicon GPU acceleration to vLLM by integrating:
 - **MCP Tool Calling** - integrate external tools via Model Context Protocol
 - **Paged KV Cache** - memory-efficient caching with prefix sharing
 - **Continuous Batching** - high throughput for multiple concurrent users
+- **Distributed Inference** - Tensor parallelism across multiple Mac Studios via Thunderbolt 5 RDMA
 
 ## Quick Start
 
@@ -208,6 +209,26 @@ print(f"Dimensions: {len(embeddings.data[0].embedding)}")
 
 See [Embeddings Guide](docs/guides/embeddings.md) for details on supported models and lazy loading.
 
+### Distributed Inference (Tensor Parallel)
+
+Run models too large for a single machine across multiple Mac Studios connected via Thunderbolt 5 RDMA:
+
+```bash
+# Launch across 2 Mac Studios with JACCL backend
+python -m vllm_mlx.distributed_launcher \
+    --backend jaccl \
+    --hostfile ~/mlx_hostfile.json \
+    -- \
+    --model <your-model-path> \
+    --continuous-batching \
+    --host 0.0.0.0 \
+    --port 8000
+```
+
+**Tested configuration:** Kimi K2.5 (612GB MoE, int4) on 2x Mac Studio M4 Ultra (512GB each), ~20.9 tok/s decode speed with ~7% distributed overhead.
+
+See [Distributed Inference Guide](docs/distributed_inference.md) for setup, RDMA configuration, and troubleshooting.
+
 ## Documentation
 
 For full documentation, see the [docs](docs/) directory:
@@ -226,6 +247,7 @@ For full documentation, see the [docs](docs/) directory:
   - [Reasoning Models](docs/guides/reasoning.md)
   - [MCP & Tool Calling](docs/guides/mcp-tools.md)
   - [Continuous Batching](docs/guides/continuous-batching.md)
+  - [Distributed Inference (Tensor Parallel)](docs/distributed_inference.md)
 
 - **Reference**
   - [CLI Commands](docs/reference/cli.md)
