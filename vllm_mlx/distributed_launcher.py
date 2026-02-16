@@ -400,13 +400,19 @@ def _worker_spec_decode_step(
 
     # 2. Run model forward (TP all_sum happens inside sharded model)
     rank = communicator.rank
+    logger.info("[SD-W] PRE-FORWARD input_shape=%s cache_idx=%s",
+                input_tokens.shape,
+                batch.cache[0]._idx if batch.cache else "N/A")
     logits = model(input_tokens, cache=batch.cache)
     # Eager eval is CRITICAL: completes the TP all_sum synchronization
     # with rank 0 before we wait for SpecDecodeResult.
     mx.eval(logits)
+    logger.info("[SD-W] POST-FORWARD logits_shape=%s", logits.shape)
 
     # 3. Receive SpecDecodeResult from rank 0
+    logger.info("[SD-W] PRE-RECEIVE waiting for SpecDecodeResult")
     spec_result = communicator.receive_spec_decode_result()
+    logger.info("[SD-W] POST-RECEIVE trim=%s", spec_result.trim_amounts)
 
     # 4. Apply KV cache trim
     if spec_result.trim_amounts and any(t > 0 for t in spec_result.trim_amounts):
@@ -643,6 +649,7 @@ def worker_loop(
                     # Execute forward pass (model computation with all_sum).
                     # This must happen on all ranks simultaneously.
                     if request_id_to_uid:  # Only if there are active requests
+                        logger.info("[W-NORMAL] step, batch_size=%d", len(request_id_to_uid))
                         _responses = batch_generator.next()
 
                         # Force async computation to complete before the

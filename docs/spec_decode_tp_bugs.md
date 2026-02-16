@@ -4,7 +4,7 @@
 > 최종 업데이트: 2026-02-16
 > 환경: 2x Mac Studio M4 Ultra 512GB, TB5 RDMA, Kimi K2.5 612GB MoE
 > 코드: vllm-mlx develop 브랜치
-> 상태: **버그 5 (TP 샘플링 동기화) 수정 완료 + 검증 완료 — 버그 6 (TP 출력 품질) 미해결**
+> 상태: **버그 7 (k≥2 데드락) 활발히 조사 중 — 버그 6 (TP 출력 품질) 미해결**
 
 ---
 
@@ -16,6 +16,9 @@ n-gram speculative decoding을 분산 Tensor Parallel (TP=2) 환경에서 발견
 2. **출력 corruption** — ⚠️ 부분 수정 (`0428e89`) — emission 수정됨, state accounting desync 잔존
 3. **Trim edge case / batch state sync** — ✅ 수정 완료 (`0428e89`, `ad2d1dc`)
 4. **Memory pressure 무한 루프** — ✅ 수정 완료 (`0428e89`)
+5. **TP 샘플링 동기화** — ✅ 수정 완료 (`d11cd16`)
+6. **TP 출력 품질 저하** — ❓ 미해결
+7. **k≥2 spec decode 데드락** — 🔴 **활발히 조사 중** (`878fc00`에서 첫 시도 실패)
 
 ---
 
@@ -386,6 +389,61 @@ Rank 1: 116 MATCH, 0 MISMATCH
 - [ ] 더 작은 TP 호환 모델로 단일 노드 vs TP 품질 비교
 - [ ] Attention score 분포 비교 (TP vs 단일)
 - [ ] DeepSeek V3 MLA의 kv_latent 분할 정밀도 분석
+
+---
+
+## 버그 7: k≥2 Spec Decode TP 데드락 — Step 50에서 결정론적 행
+
+> 발견일: 2026-02-16
+> 상태: **🔴 활발히 조사 중 (commit 878fc00에서 첫 시도 실패)**
+> 환경: Kimi K2.5, TP=2 (2x Mac Studio M4 Ultra, TB5 RDMA), n-gram speculative decoding
+
+### 증상
+
+- n-gram spec decode k=1은 정상 동작 (20.1 tok/s, acceptance 78.8%)
+- k≥2 (k=2 테스트)에서 **정확히 step 50에서 데드락** 발생
+- 재현율 100% (deterministic)
+- 약 110개 토큰 생성 후 행 (50 steps × mean_accepted 1.20 + bonus tokens)
+- Rank 0 마지막 로그: `[SpecDecode] steps=50, alpha=0.857, mean_accepted=1.20/2, per_pos=['0.86', '0.85']`
+- Rank 1 마지막 로그: startup 시의 `Polyfilled BatchKVCache.trim_per_sequence for spec decode` (step-level 로그 없음)
+- 기존 cb-baseline (spec decode 없음)도 정상 (15.8-16.2 tok/s)
+
+### 배제된 원인
+
+1. **Auto-disable**: acceptance rate 0.60 (= 1.20/2) > threshold 0.40 → should_auto_disable() returns False. 또한 commit 878fc00에서 TP 모드에서 auto-disable을 명시적으로 비활성화했으나 동일 행 재현
+2. **MoE gating routing divergence**: 게이트 라우팅은 all_sum된 입력에서 연산 → 양 Rank 동일
+3. **샘플링 desync**: _synced_step 몽키패치로 이미 해결됨 (버그 5)
+
+### 현재 가설
+
+1. **누적 batch state drift**: k=2에서는 매 step 가변 rollback (0~2 토큰) → 50 steps 동안 cache _idx, offset, left_padding 등이 Rank 간 미세 차이 누적 → protocol mismatch로 데드락
+2. **cache _idx desync**: batch_variable_trim 후 cache _idx 재계산이 Rank 0과 worker에서 다르게 진행될 가능성
+3. **3-token input 특수 케이스**: k=2에서는 [y, d1, d2] 3토큰 입력 → k=1의 [y, d1] 2토큰과 다른 edge case 존재 가능
+4. **Step 50 특수성**: rolling window (maxlen=50)이 가득 차는 시점 — auto-disable은 발동 안 하지만, metrics 관련 다른 side effect 가능
+
+### 적용된 수정 (commit 878fc00, 효과 없음)
+
+1. TP 모드에서 auto-disable 비활성화 (scheduler.py)
+2. cache _idx consistency check + fixup_cache_after_filter 추가 (scheduler.py)
+3. batch_variable_trim 후 fixup_cache_after_filter 호출 (scheduler.py)
+4. DEBUG 레벨 진단 로깅 (서버 INFO 레벨이라 출력 안 됨)
+
+### 다음 조사 단계
+
+1. INFO 레벨 진단 로깅 배포 ([SD-TP], [SD-W] prefix)
+2. ngram-k2 재실행하여 데드락 직전 마지막 로그 확인
+3. 데드락 위치 특정: model forward (all_sum) vs broadcast/receive vs batch state update
+4. Rank 간 cache state 비교 (offset, left_padding, _idx)
+
+### 관련 코드 위치
+
+| 파일 | 라인 | 설명 |
+|------|------|------|
+| `scheduler.py` | 723-734 | TP auto-disable 비활성화 (878fc00) |
+| `scheduler.py` | 959-970 | cache _idx consistency check (878fc00) |
+| `scheduler.py` | 1082-1084 | fixup_cache_after_filter after trim (878fc00) |
+| `scheduler.py` | 970-992 | INFO 진단 로깅 (미배포) |
+| `distributed_launcher.py` | 400-420 | Worker INFO 진단 로깅 (미배포) |
 
 ---
 

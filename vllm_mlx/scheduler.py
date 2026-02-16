@@ -970,8 +970,13 @@ class Scheduler:
                 fixup_cache_after_filter(batch.cache)
 
         # Run model forward (TP all_sum happens inside)
+        logger.info("[SD-TP] step=%d PRE-FORWARD input_shape=%s cache_idx=%s",
+                    self._step_count, input_tokens.shape,
+                    batch.cache[0]._idx if batch.cache else "N/A")
         logits = self.model(input_tokens, cache=batch.cache)
         mx.eval(logits)
+        logger.info("[SD-TP] step=%d POST-FORWARD logits_shape=%s",
+                    self._step_count, logits.shape)
 
         # Build VerifyResult
         verify_result = VerifyResult()
@@ -983,6 +988,8 @@ class Scheduler:
 
         # Rejection sampling
         accept_results = runtime.accept_and_commit(verify_result, draft_metadata)
+        logger.info("[SD-TP] step=%d POST-REJECT n_results=%d",
+                    self._step_count, len(accept_results))
 
         # Log spec decode stats periodically
         k = runtime.config.num_speculative_tokens
@@ -1164,7 +1171,10 @@ class Scheduler:
                 new_y=new_y,
                 finished_ids=finished_in_spec,
             )
+            logger.info("[SD-TP] step=%d PRE-BROADCAST trim=%s new_y_len=%d",
+                        self._step_count, trim_amounts, len(new_y))
             self._communicator.broadcast_spec_decode_result(spec_result)
+            logger.info("[SD-TP] step=%d POST-BROADCAST done", self._step_count)
 
         return responses
 
