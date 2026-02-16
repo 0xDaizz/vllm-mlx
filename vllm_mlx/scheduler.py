@@ -988,6 +988,8 @@ class Scheduler:
 
         # Rejection sampling
         accept_results = runtime.accept_and_commit(verify_result, draft_metadata)
+        # Force eval to prevent lazy graph accumulation across spec decode steps
+        mx.eval(batch.cache[0].offset, batch.cache[0].left_padding)
         logger.info("[SD-TP] step=%d POST-REJECT n_results=%d",
                     self._step_count, len(accept_results))
 
@@ -1089,6 +1091,7 @@ class Scheduler:
             # Recompute _idx after trim to prevent stale values
             from vllm_mlx.spec_decode.cache_utils import fixup_cache_after_filter
             fixup_cache_after_filter(batch.cache)
+            mx.eval(batch.cache[0].offset, batch.cache[0].left_padding)
 
         logger.debug(
             "[SpecDecode TP] step=%d post-trim: trim_amounts=%s, "
@@ -1175,6 +1178,9 @@ class Scheduler:
                         self._step_count, trim_amounts, len(new_y))
             self._communicator.broadcast_spec_decode_result(spec_result)
             logger.info("[SD-TP] step=%d POST-BROADCAST done", self._step_count)
+            # Ensure all pending lazy ops are resolved before next forward pass
+            if batch.cache:
+                mx.eval(batch.cache[0].offset, batch.cache[0].left_padding)
 
         return responses
 

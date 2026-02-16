@@ -423,6 +423,10 @@ def _worker_spec_decode_step(
         if batch.cache:
             mx.eval(batch.cache[0].offset, batch.cache[0].left_padding)
 
+    # Force eval to prevent lazy graph accumulation in worker
+    if batch.cache:
+        mx.eval(batch.cache[0].offset, batch.cache[0].left_padding)
+
     # 5. Update batch state
     # Set new batch.y
     batch.y = mx.array(spec_result.new_y, dtype=mx.int32)
@@ -459,6 +463,10 @@ def _worker_spec_decode_step(
         for c in batch.cache:
             cache_tensors.extend([c.keys, c.values, c.offset, c.left_padding])
         mx.eval(*cache_tensors)
+
+    # Final eval barrier before next spec decode iteration
+    if batch.cache:
+        mx.eval(batch.cache[0].offset, batch.cache[0].left_padding)
 
     # 6. Return finished IDs for removal
     return set(spec_result.finished_ids)
