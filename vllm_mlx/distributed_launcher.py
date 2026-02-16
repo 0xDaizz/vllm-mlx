@@ -421,12 +421,11 @@ def _worker_spec_decode_step(
     # Set new batch.y
     batch.y = mx.array(spec_result.new_y, dtype=mx.int32)
 
-    # Update tokens and num_tokens for each request
-    for rid, accepted in spec_result.accepted_tokens.items():
+    # Update tokens and num_tokens using canonical committed tokens (post-clipping)
+    for rid, emitted in spec_result.accepted_tokens.items():
         if rid not in request_id_to_uid:
             continue
         uid = request_id_to_uid[rid]
-        # Find batch index for this uid
         batch_idx = None
         for idx, b_uid in enumerate(batch.uids):
             if b_uid == uid:
@@ -435,19 +434,11 @@ def _worker_spec_decode_step(
         if batch_idx is None:
             continue
 
-        # Find original y for this position
-        orig_y = batch_y[batch_idx] if batch_idx < len(batch_y) else 0
-
-        # Batch all new tokens into a single concatenation
-        tokens_for_cache = accepted[:-1] if accepted else []
-        new_tokens = [orig_y] + tokens_for_cache
-        if new_tokens:
+        if emitted:
             batch.tokens[batch_idx] = mx.concatenate(
-                (batch.tokens[batch_idx], mx.array(new_tokens))
+                (batch.tokens[batch_idx], mx.array(emitted))
             )
-        # Update num_tokens
-        n_committed = len(accepted)
-        batch.num_tokens[batch_idx] += n_committed
+        batch.num_tokens[batch_idx] += len(emitted)
 
     # Materialize all updated tensors to prevent lazy graph accumulation
     mx.eval(batch.y, *batch.tokens)
@@ -524,6 +515,25 @@ def worker_loop(
         max_tokens=4096,
         sampler=sampler,
     )
+
+    # Monkey-patch _step() to add distributed sampling synchronization.
+    # mlx-lm 0.30.7 lacks dist_group support, so we wrap _step() to
+    # ensure all ranks use rank 0's sampled token. Without this, each
+    # rank samples independently → different tokens fed into model
+    # forward → corrupted all_sum → KV cache poisoning.
+    if communicator.is_distributed:
+        _orig_step = batch_generator._step
+
+        def _synced_step(input_tokens, prompt_cache, samplers, logits_processors, tokens):
+            sampled, logprobs = _orig_step(
+                input_tokens, prompt_cache, samplers, logits_processors, tokens
+            )
+            if communicator.rank > 0:
+                sampled = mx.zeros_like(sampled)
+            sampled = mx.distributed.all_sum(sampled, group=communicator.group)
+            return sampled, logprobs
+
+        batch_generator._step = _synced_step
 
     # Track request_id -> uid mapping (mirrors rank 0's scheduler)
     request_id_to_uid: dict[str, int] = {}
@@ -642,6 +652,12 @@ def worker_loop(
                         # batch.y before the async computation finishes.
                         if batch_generator.active_batch is not None:
                             mx.eval(batch_generator.active_batch.y)
+                            # Fix stale cache _idx after batch.filter() inside next().
+                            # batch_generator.next() may filter completed requests,
+                            # leaving _idx stale. This mirrors the spec decode path
+                            # fixup at line 619-621.
+                            from vllm_mlx.spec_decode.cache_utils import fixup_cache_after_filter
+                            fixup_cache_after_filter(batch_generator.active_batch.cache)
 
                     # Receive broadcast token IDs from rank 0.
                     # Protocol: rank 0 sends broadcast_int(count) then

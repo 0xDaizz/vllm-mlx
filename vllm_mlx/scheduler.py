@@ -959,6 +959,7 @@ class Scheduler:
         stop_tokens = self._get_stop_tokens()
         rollback_counts = {}
         finished_in_spec = []
+        canonical_committed = {}  # rid -> list of actually emitted token IDs
 
         for i, rid in enumerate(batch_request_ids):
             batch_idx = batch_indices[i]
@@ -983,6 +984,8 @@ class Scheduler:
                 else []
             )
 
+            emitted_for_rid = []
+
             for t_idx, token in enumerate(committed_tokens):
                 if tokens_remaining <= 0:
                     unemitted = len(committed_tokens) - t_idx
@@ -1000,6 +1003,7 @@ class Scheduler:
                     {"uid": uid, "token": token, "finish_reason": finish_reason, "prompt_cache": None},
                 )()
                 responses.append(resp)
+                emitted_for_rid.append(token)
                 tokens_remaining -= 1
 
                 if finish_reason is not None:
@@ -1009,6 +1013,7 @@ class Scheduler:
                     finished_in_spec.append(rid)
                     break
 
+            canonical_committed[rid] = emitted_for_rid
             rollback_counts[rid] = rollback_counts.get(rid, 0) + result.rollback_count
 
         # Compute trim amounts
@@ -1070,21 +1075,17 @@ class Scheduler:
         batch.y = mx.array(new_y, dtype=mx.int32)
         batch.logprobs = new_logprobs
 
-        # Update tokens list
+        # Update tokens list using canonical committed (post-clipping)
         for rid in accept_results:
-            result = accept_results[rid]
-            if rid in batch_request_ids:
+            if rid in batch_request_ids and rid in canonical_committed:
                 i = batch_request_ids.index(rid)
                 batch_idx = batch_indices[i]
-                # Batch all new tokens into a single concatenation
-                tokens_for_cache = result.accepted_tokens[:-1] if result.accepted_tokens else []
-                new_tokens = [batch_y[batch_idx]] + tokens_for_cache
-                if new_tokens:
+                emitted = canonical_committed[rid]
+                if emitted:
                     batch.tokens[batch_idx] = mx.concatenate(
-                        (batch.tokens[batch_idx], mx.array(new_tokens))
+                        (batch.tokens[batch_idx], mx.array(emitted))
                     )
-                n_committed = len(result.accepted_tokens)
-                batch.num_tokens[batch_idx] += n_committed
+                batch.num_tokens[batch_idx] += len(emitted)
 
         mx.eval(batch.y, *batch.tokens)
 
@@ -1104,7 +1105,7 @@ class Scheduler:
             # Compute new_y list for workers
             spec_result = SpecDecodeResult(
                 step_id=self._step_count,
-                accepted_tokens={rid: accept_results[rid].accepted_tokens for rid in accept_results if rid in batch_request_ids},
+                accepted_tokens={rid: canonical_committed.get(rid, []) for rid in accept_results if rid in batch_request_ids},
                 trim_amounts=trim_amounts,
                 new_y=new_y,
                 finished_ids=finished_in_spec,
@@ -1241,6 +1242,8 @@ class Scheduler:
         stop_tokens = self._get_stop_tokens()
 
         rollback_counts = {}
+        finished_in_spec = []
+        canonical_committed = {}  # rid -> list of actually emitted token IDs
 
         for i, rid in enumerate(batch_request_ids):
             batch_idx = batch_indices[i]
@@ -1264,6 +1267,8 @@ class Scheduler:
                 if result.accepted_tokens
                 else []
             )
+
+            emitted_for_rid = []
 
             for t_idx, token in enumerate(committed_tokens):
                 if tokens_remaining <= 0:
@@ -1289,6 +1294,7 @@ class Scheduler:
                 )()
 
                 responses.append(resp)
+                emitted_for_rid.append(token)
                 tokens_remaining -= 1
 
                 if finish_reason is not None:
@@ -1297,8 +1303,10 @@ class Scheduler:
                         rollback_counts[rid] = (
                             rollback_counts.get(rid, 0) + unemitted
                         )
+                    finished_in_spec.append(rid)
                     break
 
+            canonical_committed[rid] = emitted_for_rid
             # Add original rollback count from rejection
             rollback_counts[rid] = (
                 rollback_counts.get(rid, 0) + result.rollback_count
@@ -1378,28 +1386,17 @@ class Scheduler:
         batch.y = mx.array(new_y, dtype=mx.int32)
         batch.logprobs = new_logprobs
 
-        # Update num_tokens and tokens list for each request.
-        # Invariant: batch.tokens contains all tokens whose KV state is in
-        # the cache.  batch.y holds the next unprocessed token (like the
-        # normal generation path).  After trim, the cache has:
-        #   original + y + d1 + ... + d_{num_accepted}
-        # So we append y + accepted_drafts (NOT the bonus/correction) to
-        # tokens, and set batch.y = bonus (already done above).
+        # Update tokens list using canonical committed (post-clipping)
         for rid in accept_results:
-            result = accept_results[rid]
-            if rid in batch_request_ids:
+            if rid in batch_request_ids and rid in canonical_committed:
                 i = batch_request_ids.index(rid)
                 batch_idx = batch_indices[i]
-                # Batch all new tokens into a single concatenation
-                tokens_for_cache = result.accepted_tokens[:-1] if result.accepted_tokens else []
-                new_tokens = [batch_y[batch_idx]] + tokens_for_cache
-                if new_tokens:
+                emitted = canonical_committed[rid]
+                if emitted:
                     batch.tokens[batch_idx] = mx.concatenate(
-                        (batch.tokens[batch_idx], mx.array(new_tokens))
+                        (batch.tokens[batch_idx], mx.array(emitted))
                     )
-                # num_tokens tracks output tokens (all committed including bonus)
-                n_committed = len(result.accepted_tokens)
-                batch.num_tokens[batch_idx] += n_committed
+                batch.num_tokens[batch_idx] += len(emitted)
 
         mx.eval(batch.y, *batch.tokens)
 
@@ -1439,6 +1436,26 @@ class Scheduler:
             prefill_step_size=self.config.prefill_step_size,
             prompt_progress_callback=_prefill_progress,
         )
+
+        # Monkey-patch _step() to add distributed sampling synchronization.
+        # mlx-lm 0.30.7 lacks dist_group support, so we wrap _step() to
+        # ensure all ranks use rank 0's sampled token. Without this, each
+        # rank samples independently → different tokens fed into model
+        # forward → corrupted all_sum → KV cache poisoning.
+        if self._communicator is not None and self._communicator.is_distributed:
+            _orig_step = bg._step
+            _comm = self._communicator
+
+            def _synced_step(input_tokens, prompt_cache, samplers, logits_processors, tokens):
+                sampled, logprobs = _orig_step(
+                    input_tokens, prompt_cache, samplers, logits_processors, tokens
+                )
+                if _comm.rank > 0:
+                    sampled = mx.zeros_like(sampled)
+                sampled = mx.distributed.all_sum(sampled, group=_comm.group)
+                return sampled, logprobs
+
+            bg._step = _synced_step
 
         # Install chunked prefill when explicitly configured OR when
         # memory-aware cache is active (needed for prefix_boundary saves
