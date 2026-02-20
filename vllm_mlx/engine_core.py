@@ -182,9 +182,26 @@ class EngineCore:
         stream_interval = self.config.stream_interval
         use_simple_streaming = stream_interval == 1
 
-        # Emergency memory pressure threshold
-        _memory_pressure_threshold = 500 * 1024 * 1024 * 1024
+        # Emergency memory pressure threshold: 95% of Metal allocation limit.
+        # Avoids hardcoded values that are either too low (< model weight size,
+        # causing infinite clear_cache loops) or too high (> allocation limit,
+        # making the check useless).  Falls back to 90% of device memory.
         _memory_check_interval = 64
+        try:
+            _device_info = mx.device_info()
+            _max_rec = _device_info.get(
+                "max_recommended_working_set_size",
+                _device_info.get("memory_size", 0),
+            )
+            _memory_pressure_threshold = int(_max_rec * 0.95) if _max_rec > 0 else 0
+        except Exception:
+            _memory_pressure_threshold = 0  # disable check if detection fails
+        if _memory_pressure_threshold > 0:
+            logger.info(
+                f"Memory pressure threshold: "
+                f"{_memory_pressure_threshold / 1e9:.1f}GB "
+                f"(95% of {_max_rec / 1e9:.1f}GB)"
+            )
 
         # Ready barrier: signal to workers that rank 0's scheduler loop is about to begin.
         # Without this, workers enter receive_step_plan() while rank 0 is still
@@ -221,7 +238,7 @@ class EngineCore:
                     self._steps_executed += 1
 
                     # Emergency memory pressure check
-                    if self._steps_executed % _memory_check_interval == 0:
+                    if _memory_pressure_threshold > 0 and self._steps_executed % _memory_check_interval == 0:
                         try:
                             active_mem = mx.get_active_memory()
                             if active_mem > _memory_pressure_threshold:
