@@ -1447,9 +1447,14 @@ class Scheduler:
             # but MTP's hnorm expects raw decoder layer output.
             inner = self.model.model  # DeepseekV32Model (or equivalent backbone)
             h = inner.embed_tokens(input_tokens)
-            # Build attention mask using the first layer's cache offset
+            # Build attention mask using the first layer's cache offset.
+            # batch.cache[0] may be CacheList (deepseek_v32/glm_moe_dsa)
+            # or a plain KVCache; [0] accesses first KVCache in CacheList.
             _c0 = batch.cache[0]
-            _cache_for_mask = _c0[0] if isinstance(_c0, (list, tuple)) else _c0
+            try:
+                _cache_for_mask = _c0[0] if _c0 else None
+            except (TypeError, IndexError):
+                _cache_for_mask = _c0
             from mlx_lm.models.base import create_attention_mask
             mask = create_attention_mask(h, _cache_for_mask, return_array=True)
             for i in range(inner.num_layers):
