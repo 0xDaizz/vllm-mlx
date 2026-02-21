@@ -2854,7 +2854,7 @@ class Scheduler:
         for attempt in range(max_retries + 1):
             try:
                 # Schedule waiting requests
-                logger.info(
+                logger.debug(
                     "[TP-DEBUG] step(%d) BEFORE _schedule_waiting: "
                     "waiting=%d running=%d",
                     self._step_count, len(self.waiting), len(self.running),
@@ -2865,7 +2865,7 @@ class Scheduler:
                     r.num_prompt_tokens for r in scheduled
                 )
                 if scheduled:
-                    logger.info(
+                    logger.debug(
                         "[TP-DEBUG] step(%d) AFTER _schedule_waiting: "
                         "scheduled=%d ids=[%s] tokens=[%s] "
                         "running_now=%d waiting_now=%d",
@@ -2895,7 +2895,7 @@ class Scheduler:
                         if self.batch_generator and self.batch_generator.active_batch
                         else []
                     )
-                    logger.info(
+                    logger.debug(
                         "[TP-DEBUG] step(%d) BEFORE broadcast_step_plan: "
                         "inserts=%d removes=%d step_id=%d fp=%s "
                         "insert_ids=[%s] remove_ids=[%s] "
@@ -3028,7 +3028,7 @@ class Scheduler:
                                 _cache_info = f"cache_idx={_c0._idx} offset={_c0.offset.tolist()} lpad={_c0.left_padding.tolist()}"
                             except Exception:
                                 _cache_info = "unavailable"
-                        logger.info(
+                        logger.debug(
                             "[TP-DEBUG] step(%d) BEFORE batch_generator.next(): "
                             "batch_size=%d active_uids=%s running=%d %s t=%.3f",
                             self._step_count, len(_bg_uids), _bg_uids,
@@ -3045,7 +3045,7 @@ class Scheduler:
                                 _cache_info_after = f"cache_idx={_c0._idx} offset={_c0.offset.tolist()} lpad={_c0.left_padding.tolist()}"
                             except Exception:
                                 _cache_info_after = "unavailable"
-                        logger.info(
+                        logger.debug(
                             "[TP-DEBUG] step(%d) AFTER batch_generator.next(): "
                             "responses=%d %s t=%.3f",
                             self._step_count,
@@ -3067,7 +3067,7 @@ class Scheduler:
                             )
                             output.outputs = outputs
                             output.finished_request_ids = finished_ids
-                            logger.info(
+                            logger.debug(
                                 "[TP-DEBUG] step(%d) responses processed: "
                                 "outputs=%d finished=[%s] t=%.3f",
                                 self._step_count,

@@ -212,6 +212,8 @@ class EngineCore:
                 f"Engine ready barrier passed — workers can now receive StepPlans"
             )
 
+        _tp_last_log_step = 0
+
         while self._running:
             try:
                 if self.scheduler.has_requests():
@@ -227,6 +229,21 @@ class EngineCore:
                     )
                     needs_executor = has_waiting or has_partial
 
+                    _n_waiting = self.scheduler.get_num_waiting()
+                    _n_running = self.scheduler.get_num_running()
+                    # Log every step when there are waiting requests (prefill),
+                    # otherwise every 50 steps to reduce noise
+                    if has_waiting or (self._steps_executed - _tp_last_log_step >= 50):
+                        logger.debug(
+                            "[TP-DEBUG] engine_loop step=%d: "
+                            "waiting=%d running=%d has_waiting=%s "
+                            "needs_executor=%s t=%.3f",
+                            self._steps_executed, _n_waiting, _n_running,
+                            has_waiting, needs_executor,
+                            time.perf_counter(),
+                        )
+                        _tp_last_log_step = self._steps_executed
+
                     if needs_executor:
                         output = await loop.run_in_executor(
                             _executor, self.scheduler.step
@@ -236,6 +253,16 @@ class EngineCore:
                         # Yield to event loop after inline step
                         await asyncio.sleep(0)
                     self._steps_executed += 1
+
+                    if output.scheduled_request_ids or output.finished_request_ids:
+                        logger.debug(
+                            "[TP-DEBUG] engine_loop step=%d output: "
+                            "scheduled=%d finished=%d outputs=%d",
+                            self._steps_executed,
+                            len(output.scheduled_request_ids) if output.scheduled_request_ids else 0,
+                            len(output.finished_request_ids) if output.finished_request_ids else 0,
+                            len(output.outputs) if output.outputs else 0,
+                        )
 
                     # Emergency memory pressure check
                     if _memory_pressure_threshold > 0 and self._steps_executed % _memory_check_interval == 0:
@@ -351,6 +378,17 @@ class EngineCore:
             stream_interval=self.config.stream_interval
         )
         self._finished_events[request_id] = asyncio.Event()
+
+        logger.debug(
+            "[TP-DEBUG] add_request: req=%s "
+            "active_collectors=%d "
+            "scheduler_waiting=%d scheduler_running=%d t=%.3f",
+            request_id[:12],
+            len(self._output_collectors),
+            self.scheduler.get_num_waiting(),
+            self.scheduler.get_num_running(),
+            time.perf_counter(),
+        )
 
         # Add to scheduler
         self.scheduler.add_request(request)

@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import os
 import pickle
+import time as _tp_time
 from dataclasses import dataclass
 from typing import Any
 
@@ -214,33 +215,88 @@ class MLXCommunicator:
 
         import mlx.core as mx
 
+        _bo_t0 = _tp_time.perf_counter()
+        _obj_type = type(obj).__name__ if obj is not None else "None"
+        logger.debug(
+            "[TP-DEBUG] broadcast_object ENTER: rank=%d src=%d obj_type=%s",
+            self._rank, src, _obj_type,
+        )
+
         if self._rank == src:
             raw = pickle.dumps(obj)
             data = mx.array(list(raw), dtype=mx.uint8)
             size = data.size
             checksum = zlib.crc32(raw) & 0xFFFFFFFF
             # Broadcast size
+            logger.debug(
+                "[TP-DEBUG] broadcast_object rank=%d all_sum #1 START (size=%d bytes)",
+                self._rank, size,
+            )
             mx.eval(mx.distributed.all_sum(mx.array(size), group=self._group))
+            logger.debug(
+                "[TP-DEBUG] broadcast_object rank=%d all_sum #1 DONE (size) t=%.3f",
+                self._rank, _tp_time.perf_counter() - _bo_t0,
+            )
             # Broadcast data
+            logger.debug(
+                "[TP-DEBUG] broadcast_object rank=%d all_sum #2 START (data, %d bytes)",
+                self._rank, size,
+            )
             mx.eval(mx.distributed.all_sum(data, group=self._group))
+            logger.debug(
+                "[TP-DEBUG] broadcast_object rank=%d all_sum #2 DONE (data) t=%.3f",
+                self._rank, _tp_time.perf_counter() - _bo_t0,
+            )
             # Broadcast checksum
+            logger.debug(
+                "[TP-DEBUG] broadcast_object rank=%d all_sum #3 START (crc=%08x)",
+                self._rank, checksum,
+            )
             mx.eval(mx.distributed.all_sum(mx.array(checksum, dtype=mx.uint32), group=self._group))
+            logger.debug(
+                "[TP-DEBUG] broadcast_object rank=%d all_sum #3 DONE (checksum) t=%.3f",
+                self._rank, _tp_time.perf_counter() - _bo_t0,
+            )
             return obj
         else:
             # Receive size
+            logger.debug(
+                "[TP-DEBUG] broadcast_object rank=%d all_sum #1 START (recv size)",
+                self._rank,
+            )
             size = mx.distributed.all_sum(
                 mx.array(0), group=self._group
             ).item()
+            logger.debug(
+                "[TP-DEBUG] broadcast_object rank=%d all_sum #1 DONE (size=%d) t=%.3f",
+                self._rank, size, _tp_time.perf_counter() - _bo_t0,
+            )
             # Receive data
+            logger.debug(
+                "[TP-DEBUG] broadcast_object rank=%d all_sum #2 START (recv data, %d bytes)",
+                self._rank, size,
+            )
             data = mx.distributed.all_sum(
                 mx.zeros(size, dtype=mx.uint8), group=self._group
             )
             mx.eval(data)
+            logger.debug(
+                "[TP-DEBUG] broadcast_object rank=%d all_sum #2 DONE (data) t=%.3f",
+                self._rank, _tp_time.perf_counter() - _bo_t0,
+            )
             raw = bytes(data.tolist())
             # Receive and verify checksum
+            logger.debug(
+                "[TP-DEBUG] broadcast_object rank=%d all_sum #3 START (recv checksum)",
+                self._rank,
+            )
             expected_checksum = mx.distributed.all_sum(
                 mx.array(0, dtype=mx.uint32), group=self._group
             ).item()
+            logger.debug(
+                "[TP-DEBUG] broadcast_object rank=%d all_sum #3 DONE (crc=%08x) t=%.3f",
+                self._rank, expected_checksum, _tp_time.perf_counter() - _bo_t0,
+            )
             actual_checksum = zlib.crc32(raw) & 0xFFFFFFFF
             if actual_checksum != expected_checksum:
                 raise RuntimeError(
@@ -248,6 +304,10 @@ class MLXCommunicator:
                     f"expected CRC32={expected_checksum:#010x}, "
                     f"got {actual_checksum:#010x} (size={size})"
                 )
+            logger.debug(
+                "[TP-DEBUG] broadcast_object rank=%d checksum OK, total=%.3fs",
+                self._rank, _tp_time.perf_counter() - _bo_t0,
+            )
             return pickle.loads(raw)
 
     # -- high-level helpers -------------------------------------------------
@@ -267,14 +327,45 @@ class MLXCommunicator:
                 "use receive_step_plan on non-zero ranks",
                 self._rank,
             )
+        _bsp_t0 = _tp_time.perf_counter()
+        _plan_desc = "None"
+        if plan is not None:
+            _plan_desc = (
+                f"step={plan.step_id} ins={len(plan.inserts)} "
+                f"rem={len(plan.removes)} fp={plan.fingerprint}"
+            )
+        logger.debug(
+            "[TP-DEBUG] broadcast_step_plan ENTER: rank=%d plan=(%s)",
+            self._rank, _plan_desc,
+        )
         self.broadcast_object(plan, src=0)
+        logger.debug(
+            "[TP-DEBUG] broadcast_step_plan EXIT: rank=%d elapsed=%.3fs",
+            self._rank, _tp_time.perf_counter() - _bsp_t0,
+        )
 
     def receive_step_plan(self) -> StepPlan:
         """Receive a :class:`StepPlan` on a non-rank-0 worker.
 
         Internally calls :meth:`broadcast_object` with ``src=0``.
         """
-        return self.broadcast_object(None, src=0)
+        _rsp_t0 = _tp_time.perf_counter()
+        logger.debug(
+            "[TP-DEBUG] receive_step_plan ENTER: rank=%d",
+            self._rank,
+        )
+        result = self.broadcast_object(None, src=0)
+        _plan_desc = "None"
+        if result is not None:
+            _plan_desc = (
+                f"step={result.step_id} ins={len(result.inserts)} "
+                f"rem={len(result.removes)} fp={result.fingerprint}"
+            )
+        logger.debug(
+            "[TP-DEBUG] receive_step_plan EXIT: rank=%d plan=(%s) elapsed=%.3fs",
+            self._rank, _plan_desc, _tp_time.perf_counter() - _rsp_t0,
+        )
+        return result
 
     def broadcast_tokens(self, token_ids, src: int = 0):
         """Broadcast sampled token IDs from *src* to every rank.
