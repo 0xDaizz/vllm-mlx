@@ -596,7 +596,7 @@ def worker_loop(
                     logger.info(f"[Rank {rank}] Received None plan, shutting down")
                     break
 
-                logger.info(
+                logger.debug(
                     "[TP-DEBUG] worker(%d) RECEIVED step_plan: "
                     "step_id=%d inserts=%d removes=%d fp=%s "
                     "insert_ids=[%s] remove_ids=[%s] "
@@ -614,7 +614,7 @@ def worker_loop(
                 for request_id in plan.removes:
                     if request_id in request_id_to_uid:
                         uid = request_id_to_uid[request_id]
-                        logger.info(
+                        logger.debug(
                             "[TP-DEBUG] worker(%d) REMOVE: req=%s uid=%d",
                             rank, request_id[:12], uid,
                         )
@@ -627,7 +627,7 @@ def worker_loop(
 
                 # Apply inserts
                 for insert_op in plan.inserts:
-                    logger.info(
+                    logger.debug(
                         "[TP-DEBUG] worker(%d) BEFORE insert: "
                         "req=%s tokens=%d max_tokens=%d",
                         rank, insert_op.request_id[:12],
@@ -641,13 +641,13 @@ def worker_loop(
                         uid = uids[0]
                         request_id_to_uid[insert_op.request_id] = uid
                         uid_to_request_id[uid] = insert_op.request_id
-                        logger.info(
+                        logger.debug(
                             "[TP-DEBUG] worker(%d) AFTER insert: "
                             "req=%s uid=%d success=True",
                             rank, insert_op.request_id[:12], uid,
                         )
                     else:
-                        logger.info(
+                        logger.debug(
                             "[TP-DEBUG] worker(%d) AFTER insert: "
                             "req=%s uids=None success=False",
                             rank, insert_op.request_id[:12],
@@ -670,7 +670,7 @@ def worker_loop(
                     local_fingerprint = hashlib.md5(
                         local_fp_data.encode()
                     ).hexdigest()[:16]
-                    logger.info(
+                    logger.debug(
                         "[TP-DEBUG] worker(%d) fingerprint check: "
                         "local=%s remote=%s match=%s "
                         "local_reqs=%d batch_size=%d "
@@ -726,7 +726,7 @@ def worker_loop(
                                 _cache_info = f"cache_idx={_c0._idx} offset={_c0.offset.tolist()} lpad={_c0.left_padding.tolist()}"
                             except Exception:
                                 _cache_info = "unavailable"
-                        logger.info(
+                        logger.debug(
                             "[TP-DEBUG] worker(%d) BEFORE next(): "
                             "step_id=%d batch_size=%d active_uids=%s "
                             "req_map=%s %s t=%.3f",
@@ -736,6 +736,7 @@ def worker_loop(
                             _cache_info,
                             _tp_time.perf_counter() - _tp_loop_t0,
                         )
+                        _batch_size_before = len(batch_generator.active_batch.y) if batch_generator.active_batch else 0
                         _responses = batch_generator.next()
                         _cache_info_after = ""
                         if batch_generator.active_batch and batch_generator.active_batch.cache:
@@ -744,7 +745,7 @@ def worker_loop(
                                 _cache_info_after = f"cache_idx={_c0._idx} offset={_c0.offset.tolist()} lpad={_c0.left_padding.tolist()}"
                             except Exception:
                                 _cache_info_after = "unavailable"
-                        logger.info(
+                        logger.debug(
                             "[TP-DEBUG] worker(%d) AFTER next(): "
                             "step_id=%d responses=%d %s t=%.3f",
                             rank, plan.step_id,
@@ -757,19 +758,19 @@ def worker_loop(
                         # batch_generator.next() with dist_group triggers all_sum
                         # lazily; mx.eval materializes the result.
                         if batch_generator.active_batch is not None:
-                            mx.eval(batch_generator.active_batch.y)
-                            logger.info(
-                                "[TP-DEBUG] worker(%d) AFTER mx.eval(y): "
-                                "step_id=%d t=%.3f",
-                                rank, plan.step_id,
-                                _tp_time.perf_counter() - _tp_loop_t0,
-                            )
-                            # Fix stale cache _idx after batch.filter() inside next().
-                            # batch_generator.next() may filter completed requests,
-                            # leaving _idx stale. This mirrors the spec decode path
-                            # fixup at line 619-621.
-                            from vllm_mlx.spec_decode.cache_utils import fixup_cache_after_filter
-                            fixup_cache_after_filter(batch_generator.active_batch.cache)
+                            # Only run cache fixup when batch.filter() removed a request.
+                            # fixup_cache_after_filter iterates all layers (expensive for
+                            # deep models like Kimi K2.5).  mx.eval(batch.y) is also
+                            # unnecessary per-token since _synced_step already evals.
+                            _batch_size_after = len(batch_generator.active_batch.y)
+                            if _batch_size_after < _batch_size_before:
+                                from vllm_mlx.spec_decode.cache_utils import fixup_cache_after_filter
+                                fixup_cache_after_filter(batch_generator.active_batch.cache)
+                                logger.debug(
+                                    "[TP-DEBUG] worker(%d) fixup_cache_after_filter: "
+                                    "batch %d -> %d step_id=%d",
+                                    rank, _batch_size_before, _batch_size_after, plan.step_id,
+                                )
 
 
             except Exception as e:
