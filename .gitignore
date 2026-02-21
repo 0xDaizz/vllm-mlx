@@ -97,4 +97,6 @@ temp/
 .mlx_cache/
 
 # Local scripts (contain environment-specific paths/IPs)
-scripts/
+scripts/*
+!scripts/cluster_monitor.py
+!scripts/rdma_setup.py
