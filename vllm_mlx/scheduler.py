@@ -1710,8 +1710,6 @@ class Scheduler:
 
         # Monkey-patch _step() to add distributed sampling synchronization.
         # All ranks must use rank 0's sampled token to prevent KV cache divergence.
-        # Use `sampled * 0` (not `mx.zeros_like`) to preserve the lazy dependency
-        # chain through the model forward pass.
         if self._communicator is not None and self._communicator.is_distributed:
             _orig_step = bg._step
             _comm = self._communicator
@@ -1720,8 +1718,13 @@ class Scheduler:
                 sampled, logprobs = _orig_step(
                     input_tokens, prompt_cache, samplers, logits_processors, tokens
                 )
+                # Force model forward eval (including TP all_sum inside MoE layers).
+                # Both ranks must complete the model's internal collectives BEFORE
+                # we break the dependency chain with zeros_like.
+                mx.eval(sampled)
+                # Now sync sampling: zero non-rank-0, all_sum to broadcast rank 0's token.
                 if _comm.rank > 0:
-                    sampled = sampled * 0
+                    sampled = mx.zeros_like(sampled)
                 sampled = mx.distributed.all_sum(sampled, group=_comm.group)
                 mx.eval(sampled)
                 return sampled, logprobs

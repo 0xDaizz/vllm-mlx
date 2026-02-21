@@ -533,9 +533,6 @@ def worker_loop(
 
     # Monkey-patch _step() to add distributed sampling synchronization.
     # All ranks must use rank 0's sampled token to prevent KV cache divergence.
-    # Use `sampled * 0` (not `mx.zeros_like`) to preserve the lazy dependency
-    # chain through the model forward pass — both ranks must execute MoE all_sum
-    # ops inside the model before the sampling all_sum runs.
     if communicator.is_distributed:
         _orig_step = batch_generator._step
 
@@ -543,11 +540,13 @@ def worker_loop(
             sampled, logprobs = _orig_step(
                 input_tokens, prompt_cache, samplers, logits_processors, tokens
             )
-            # Zero non-rank-0 while keeping dependency on model forward graph.
-            # sampled * 0 still depends on sampled, so eval will run the full
-            # model forward (including MoE all_sum) on all ranks.
+            # Force model forward eval (including TP all_sum inside MoE layers).
+            # Both ranks must complete the model's internal collectives BEFORE
+            # we break the dependency chain with zeros_like.
+            mx.eval(sampled)
+            # Now sync sampling: zero non-rank-0, all_sum to broadcast rank 0's token.
             if communicator.rank > 0:
-                sampled = sampled * 0
+                sampled = mx.zeros_like(sampled)
             sampled = mx.distributed.all_sum(sampled, group=communicator.group)
             mx.eval(sampled)
             return sampled, logprobs
