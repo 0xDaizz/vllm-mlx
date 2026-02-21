@@ -100,3 +100,5 @@ temp/
 scripts/*
 !scripts/cluster_monitor.py
 !scripts/rdma_setup.py
+!scripts/tp_start.py
+!scripts/tp_stop.py
