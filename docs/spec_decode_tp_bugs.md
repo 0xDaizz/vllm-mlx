@@ -4,7 +4,7 @@
 > 최종 업데이트: 2026-02-21
 > 환경: 2x Mac Studio M4 Ultra 512GB, TB5 RDMA, Kimi K2.5 612GB MoE
 > 코드: vllm-mlx develop 브랜치
-> 상태: **버그 7 (k≥2 데드락) 활발히 조사 중 — 버그 6 (TP 출력 품질) 해결됨 (JACCL wc.status 패치)**
+> 상태: **버그 8 (TP=2 동시요청 hang) 활발히 조사 중 — 버그 6 (TP 출력 품질) 해결됨 (JACCL wc.status 패치)**
 
 ---
 
@@ -19,6 +19,7 @@ n-gram speculative decoding을 분산 Tensor Parallel (TP=2) 환경에서 발견
 5. **TP 샘플링 동기화** — ✅ 수정 완료 (`d11cd16`)
 6. **TP 출력 품질 저하** — ✅ 해결됨 (JACCL wc.status 패치, 2026-02-21)
 7. **k≥2 spec decode 데드락** — 🔴 **활발히 조사 중** (`878fc00`에서 첫 시도 실패)
+8. **TP=2 동시 요청 batch hang** — 🔴 **활발히 조사 중** — 상세: [`tp_batch_hang_bug8.md`](tp_batch_hang_bug8.md)
 
 ---
 
