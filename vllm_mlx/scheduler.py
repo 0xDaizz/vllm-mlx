@@ -1709,28 +1709,21 @@ class Scheduler:
         )
 
         # Monkey-patch _step() to add distributed sampling synchronization.
-        # mlx-lm 0.30.7 lacks dist_group support, so we wrap _step() to
-        # ensure all ranks use rank 0's sampled token. Without this, each
-        # rank samples independently → different tokens fed into model
-        # forward → corrupted all_sum → KV cache poisoning.
+        # All ranks must use rank 0's sampled token to prevent KV cache divergence.
+        # Use `sampled * 0` (not `mx.zeros_like`) to preserve the lazy dependency
+        # chain through the model forward pass.
         if self._communicator is not None and self._communicator.is_distributed:
             _orig_step = bg._step
             _comm = self._communicator
 
-            _step_count = [0]
             def _synced_step(input_tokens, prompt_cache, samplers, logits_processors, tokens):
                 sampled, logprobs = _orig_step(
                     input_tokens, prompt_cache, samplers, logits_processors, tokens
                 )
-                pre_sync = sampled.item() if sampled.size == 1 else sampled.tolist()
                 if _comm.rank > 0:
-                    sampled = mx.zeros_like(sampled)
+                    sampled = sampled * 0
                 sampled = mx.distributed.all_sum(sampled, group=_comm.group)
                 mx.eval(sampled)
-                post_sync = sampled.item() if sampled.size == 1 else sampled.tolist()
-                _step_count[0] += 1
-                if _step_count[0] <= 50:
-                    logger.debug("[_synced_step] rank=%d step=%d pre=%s post=%s", _comm.rank, _step_count[0], pre_sync, post_sync)
                 return sampled, logprobs
 
             bg._step = _synced_step
@@ -2267,6 +2260,9 @@ class Scheduler:
             uid = self.request_id_to_uid[request_id]
             if self.batch_generator is not None:
                 self.batch_generator.remove([uid])
+                if self.batch_generator.active_batch is not None:
+                    from vllm_mlx.spec_decode.cache_utils import fixup_cache_after_filter
+                    fixup_cache_after_filter(self.batch_generator.active_batch.cache)
                 removed_from_batch = True
             del self.uid_to_request_id[uid]
             del self.request_id_to_uid[request_id]
@@ -2849,6 +2845,8 @@ class Scheduler:
             SchedulerOutput with results of this step
         """
         output = SchedulerOutput()
+        import time as _tp_time
+        _tp_t0 = _tp_time.perf_counter()
 
         # Process pending aborts FIRST (in executor thread, safe for MLX)
         self._process_pending_aborts()
@@ -2856,11 +2854,27 @@ class Scheduler:
         for attempt in range(max_retries + 1):
             try:
                 # Schedule waiting requests
+                logger.info(
+                    "[TP-DEBUG] step(%d) BEFORE _schedule_waiting: "
+                    "waiting=%d running=%d",
+                    self._step_count, len(self.waiting), len(self.running),
+                )
                 scheduled = self._schedule_waiting()
                 output.scheduled_request_ids = [r.request_id for r in scheduled]
                 output.num_scheduled_tokens = sum(
                     r.num_prompt_tokens for r in scheduled
                 )
+                if scheduled:
+                    logger.info(
+                        "[TP-DEBUG] step(%d) AFTER _schedule_waiting: "
+                        "scheduled=%d ids=[%s] tokens=[%s] "
+                        "running_now=%d waiting_now=%d",
+                        self._step_count,
+                        len(scheduled),
+                        ",".join(r.request_id[:12] for r in scheduled),
+                        ",".join(str(r.num_prompt_tokens) for r in scheduled),
+                        len(self.running), len(self.waiting),
+                    )
 
                 # Determine spec decode eligibility BEFORE StepPlan broadcast
                 # so workers know whether to expect a spec decode step
@@ -2875,6 +2889,25 @@ class Scheduler:
                     plan = self._build_step_plan(
                         scheduled, self._pending_distributed_removes,
                         spec_decode_plan=spec_plan,
+                    )
+                    _active_uids = (
+                        list(self.batch_generator.active_batch.uids)
+                        if self.batch_generator and self.batch_generator.active_batch
+                        else []
+                    )
+                    logger.info(
+                        "[TP-DEBUG] step(%d) BEFORE broadcast_step_plan: "
+                        "inserts=%d removes=%d step_id=%d fp=%s "
+                        "insert_ids=[%s] remove_ids=[%s] "
+                        "batch_uids=%s spec=%s t=%.3f",
+                        self._step_count,
+                        len(plan.inserts), len(plan.removes),
+                        plan.step_id, plan.fingerprint,
+                        ",".join(op.request_id[:12] for op in plan.inserts),
+                        ",".join(r[:12] for r in plan.removes),
+                        _active_uids,
+                        "yes" if plan.spec_decode_plan else "no",
+                        _tp_time.perf_counter() - _tp_t0,
                     )
                     self._communicator.broadcast_step_plan(plan)
                     self._pending_distributed_removes.clear()
@@ -2984,9 +3017,43 @@ class Scheduler:
                                 output.finished_request_ids = finished_ids
                                 self._cleanup_finished(finished_ids)
                     else:
+                        _bg_uids = (
+                            list(self.batch_generator.active_batch.uids)
+                            if self.batch_generator.active_batch else []
+                        )
+                        _cache_info = ""
+                        if self.batch_generator.active_batch and self.batch_generator.active_batch.cache:
+                            try:
+                                _c0 = self.batch_generator.active_batch.cache[0]
+                                _cache_info = f"cache_idx={_c0._idx} offset={_c0.offset.tolist()} lpad={_c0.left_padding.tolist()}"
+                            except Exception:
+                                _cache_info = "unavailable"
+                        logger.info(
+                            "[TP-DEBUG] step(%d) BEFORE batch_generator.next(): "
+                            "batch_size=%d active_uids=%s running=%d %s t=%.3f",
+                            self._step_count, len(_bg_uids), _bg_uids,
+                            len(self.running),
+                            _cache_info,
+                            _tp_time.perf_counter() - _tp_t0,
+                        )
                         responses = self.batch_generator.next()
                         output.has_work = True
-                        # In TP mode, _synced_step already synchronized tokens via all_sum
+                        _cache_info_after = ""
+                        if self.batch_generator.active_batch and self.batch_generator.active_batch.cache:
+                            try:
+                                _c0 = self.batch_generator.active_batch.cache[0]
+                                _cache_info_after = f"cache_idx={_c0._idx} offset={_c0.offset.tolist()} lpad={_c0.left_padding.tolist()}"
+                            except Exception:
+                                _cache_info_after = "unavailable"
+                        logger.info(
+                            "[TP-DEBUG] step(%d) AFTER batch_generator.next(): "
+                            "responses=%d %s t=%.3f",
+                            self._step_count,
+                            len(responses) if responses else 0,
+                            _cache_info_after,
+                            _tp_time.perf_counter() - _tp_t0,
+                        )
+                        # In TP mode, dist_group synchronizes tokens via all_sum
                         # during next(). _broadcast_sampled_tokens is only needed in non-TP mode.
                         if responses:
                             # Invalidate stale MTP hidden states after normal decode
@@ -3000,6 +3067,14 @@ class Scheduler:
                             )
                             output.outputs = outputs
                             output.finished_request_ids = finished_ids
+                            logger.info(
+                                "[TP-DEBUG] step(%d) responses processed: "
+                                "outputs=%d finished=[%s] t=%.3f",
+                                self._step_count,
+                                len(outputs),
+                                ",".join(fid[:12] for fid in finished_ids),
+                                _tp_time.perf_counter() - _tp_t0,
+                            )
                             self._cleanup_finished(finished_ids)
 
                 # Success - break out of retry loop

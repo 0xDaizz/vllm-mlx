@@ -527,31 +527,29 @@ def worker_loop(
     batch_generator = BatchGenerator(
         model=model,
         max_tokens=4096,
+        stop_tokens=set(tokenizer.eos_token_ids) if hasattr(tokenizer, 'eos_token_ids') else set(),
         sampler=sampler,
     )
 
     # Monkey-patch _step() to add distributed sampling synchronization.
-    # mlx-lm 0.30.7 lacks dist_group support, so we wrap _step() to
-    # ensure all ranks use rank 0's sampled token. Without this, each
-    # rank samples independently → different tokens fed into model
-    # forward → corrupted all_sum → KV cache poisoning.
+    # All ranks must use rank 0's sampled token to prevent KV cache divergence.
+    # Use `sampled * 0` (not `mx.zeros_like`) to preserve the lazy dependency
+    # chain through the model forward pass — both ranks must execute MoE all_sum
+    # ops inside the model before the sampling all_sum runs.
     if communicator.is_distributed:
         _orig_step = batch_generator._step
 
-        _step_count = [0]
         def _synced_step(input_tokens, prompt_cache, samplers, logits_processors, tokens):
             sampled, logprobs = _orig_step(
                 input_tokens, prompt_cache, samplers, logits_processors, tokens
             )
-            pre_sync = sampled.item() if sampled.size == 1 else sampled.tolist()
+            # Zero non-rank-0 while keeping dependency on model forward graph.
+            # sampled * 0 still depends on sampled, so eval will run the full
+            # model forward (including MoE all_sum) on all ranks.
             if communicator.rank > 0:
-                sampled = mx.zeros_like(sampled)
+                sampled = sampled * 0
             sampled = mx.distributed.all_sum(sampled, group=communicator.group)
             mx.eval(sampled)
-            post_sync = sampled.item() if sampled.size == 1 else sampled.tolist()
-            _step_count[0] += 1
-            if _step_count[0] <= 50:
-                logger.debug("[_synced_step] rank=%d step=%d pre=%s post=%s", communicator.rank, _step_count[0], pre_sync, post_sync)
             return sampled, logprobs
 
         batch_generator._step = _synced_step
@@ -582,27 +580,59 @@ def worker_loop(
     signal.signal(signal.SIGINT, _shutdown_handler)
 
     try:
+        import time as _tp_time
+
         # Step 3: StepPlan processing loop
         while not shutdown_event.is_set():
             try:
+                _tp_loop_t0 = _tp_time.perf_counter()
+
                 # Receive StepPlan from rank 0
                 plan = communicator.receive_step_plan()
+                _tp_recv_t = _tp_time.perf_counter() - _tp_loop_t0
 
                 if plan is None:
                     # Shutdown signal
                     logger.info(f"[Rank {rank}] Received None plan, shutting down")
                     break
 
+                logger.info(
+                    "[TP-DEBUG] worker(%d) RECEIVED step_plan: "
+                    "step_id=%d inserts=%d removes=%d fp=%s "
+                    "insert_ids=[%s] remove_ids=[%s] "
+                    "spec=%s recv_time=%.3fs",
+                    rank, plan.step_id,
+                    len(plan.inserts), len(plan.removes),
+                    plan.fingerprint,
+                    ",".join(op.request_id[:12] for op in plan.inserts),
+                    ",".join(r[:12] for r in plan.removes),
+                    "yes" if plan.spec_decode_plan else "no",
+                    _tp_recv_t,
+                )
+
                 # Apply removes first
                 for request_id in plan.removes:
                     if request_id in request_id_to_uid:
                         uid = request_id_to_uid[request_id]
+                        logger.info(
+                            "[TP-DEBUG] worker(%d) REMOVE: req=%s uid=%d",
+                            rank, request_id[:12], uid,
+                        )
                         batch_generator.remove([uid])
+                        if batch_generator.active_batch is not None:
+                            from vllm_mlx.spec_decode.cache_utils import fixup_cache_after_filter
+                            fixup_cache_after_filter(batch_generator.active_batch.cache)
                         del request_id_to_uid[request_id]
                         del uid_to_request_id[uid]
 
                 # Apply inserts
                 for insert_op in plan.inserts:
+                    logger.info(
+                        "[TP-DEBUG] worker(%d) BEFORE insert: "
+                        "req=%s tokens=%d max_tokens=%d",
+                        rank, insert_op.request_id[:12],
+                        len(insert_op.tokens), insert_op.max_tokens,
+                    )
                     uids = batch_generator.insert(
                         [insert_op.tokens],
                         max_tokens=[insert_op.max_tokens],
@@ -611,6 +641,17 @@ def worker_loop(
                         uid = uids[0]
                         request_id_to_uid[insert_op.request_id] = uid
                         uid_to_request_id[uid] = insert_op.request_id
+                        logger.info(
+                            "[TP-DEBUG] worker(%d) AFTER insert: "
+                            "req=%s uid=%d success=True",
+                            rank, insert_op.request_id[:12], uid,
+                        )
+                    else:
+                        logger.info(
+                            "[TP-DEBUG] worker(%d) AFTER insert: "
+                            "req=%s uids=None success=False",
+                            rank, insert_op.request_id[:12],
+                        )
 
                 # Verify fingerprint for batch sync detection
                 if plan.fingerprint:
@@ -629,6 +670,16 @@ def worker_loop(
                     local_fingerprint = hashlib.md5(
                         local_fp_data.encode()
                     ).hexdigest()[:16]
+                    logger.info(
+                        "[TP-DEBUG] worker(%d) fingerprint check: "
+                        "local=%s remote=%s match=%s "
+                        "local_reqs=%d batch_size=%d "
+                        "local_ids=[%s]",
+                        rank, local_fingerprint, plan.fingerprint,
+                        local_fingerprint == plan.fingerprint,
+                        len(local_running_ids), local_batch_size,
+                        ",".join(rid[:12] for rid in local_running_ids),
+                    )
                     if local_fingerprint != plan.fingerprint:
                         logger.error(
                             f"[Rank {rank}] BATCH DESYNC DETECTED! "
@@ -664,14 +715,55 @@ def worker_loop(
                     # Execute forward pass (model computation with all_sum).
                     # This must happen on all ranks simultaneously.
                     if request_id_to_uid:  # Only if there are active requests
-                        logger.info("[W-NORMAL] step, batch_size=%d", len(request_id_to_uid))
+                        _w_active_uids = (
+                            list(batch_generator.active_batch.uids)
+                            if batch_generator.active_batch else []
+                        )
+                        _cache_info = ""
+                        if batch_generator.active_batch and batch_generator.active_batch.cache:
+                            try:
+                                _c0 = batch_generator.active_batch.cache[0]
+                                _cache_info = f"cache_idx={_c0._idx} offset={_c0.offset.tolist()} lpad={_c0.left_padding.tolist()}"
+                            except Exception:
+                                _cache_info = "unavailable"
+                        logger.info(
+                            "[TP-DEBUG] worker(%d) BEFORE next(): "
+                            "step_id=%d batch_size=%d active_uids=%s "
+                            "req_map=%s %s t=%.3f",
+                            rank, plan.step_id,
+                            len(request_id_to_uid), _w_active_uids,
+                            {k[:12]: v for k, v in request_id_to_uid.items()},
+                            _cache_info,
+                            _tp_time.perf_counter() - _tp_loop_t0,
+                        )
                         _responses = batch_generator.next()
+                        _cache_info_after = ""
+                        if batch_generator.active_batch and batch_generator.active_batch.cache:
+                            try:
+                                _c0 = batch_generator.active_batch.cache[0]
+                                _cache_info_after = f"cache_idx={_c0._idx} offset={_c0.offset.tolist()} lpad={_c0.left_padding.tolist()}"
+                            except Exception:
+                                _cache_info_after = "unavailable"
+                        logger.info(
+                            "[TP-DEBUG] worker(%d) AFTER next(): "
+                            "step_id=%d responses=%d %s t=%.3f",
+                            rank, plan.step_id,
+                            len(_responses) if _responses else 0,
+                            _cache_info_after,
+                            _tp_time.perf_counter() - _tp_loop_t0,
+                        )
 
                         # Force lazy all_sum computation to complete.
-                        # batch_generator.next() triggers _synced_step which
-                        # calls all_sum lazily; mx.eval materializes the result.
+                        # batch_generator.next() with dist_group triggers all_sum
+                        # lazily; mx.eval materializes the result.
                         if batch_generator.active_batch is not None:
                             mx.eval(batch_generator.active_batch.y)
+                            logger.info(
+                                "[TP-DEBUG] worker(%d) AFTER mx.eval(y): "
+                                "step_id=%d t=%.3f",
+                                rank, plan.step_id,
+                                _tp_time.perf_counter() - _tp_loop_t0,
+                            )
                             # Fix stale cache _idx after batch.filter() inside next().
                             # batch_generator.next() may filter completed requests,
                             # leaving _idx stale. This mirrors the spec decode path
