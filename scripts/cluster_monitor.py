@@ -654,7 +654,7 @@ class Dashboard:
     def __init__(
         self,
         pollers: list[tuple[str, NodePoller]],
-        interval: float = 3.0,
+        interval: float = 1.0,
     ) -> None:
         self.pollers = pollers
         self.interval = interval
@@ -784,9 +784,9 @@ examples:
     parser.add_argument(
         "--interval",
         type=float,
-        default=3.0,
+        default=1.0,
         metavar="SECONDS",
-        help="Polling interval in seconds (default: 3).",
+        help="Polling interval in seconds (default: 1).",
     )
     parser.add_argument(
         "--proxy",

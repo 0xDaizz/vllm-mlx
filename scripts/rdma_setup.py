@@ -3,7 +3,7 @@
 """
 RDMA network setup for Mac Studio Thunderbolt 5 connections.
 
-Configures static IPs, removes interfaces from bridges, writes IBV config,
+Configures static IPs, removes interfaces from bridges,
 and verifies RDMA connectivity between nodes via SSH.
 
 Usage:
@@ -31,7 +31,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import re
 import subprocess
@@ -91,7 +90,6 @@ class NodeConfig:
     # Populated during configuration
     bridge_removed: str | None = None
     ip_set: bool = False
-    ibv_written: bool = False
     rdma_enabled: bool | None = None
     ibv_devices: list[str] = field(default_factory=list)
 
@@ -256,56 +254,6 @@ def step_set_static_ip(node: NodeConfig, netmask_bits: int, dry_run: bool) -> No
         )
 
 
-def step_write_ibv_config(
-    node: NodeConfig,
-    all_nodes: list[NodeConfig],
-    node_index: int,
-    dry_run: bool,
-) -> None:
-    """Write /tmp/mlx_ibv_devices.json with the JACCL-compatible NxN matrix.
-
-    The matrix format is: matrix[i][j] = RDMA device that node i uses to
-    reach node j, or null when i == j (a node cannot talk to itself).
-    Each node uses its own interface to reach any other node, so
-    matrix[i][j] = "rdma_{nodes[i].interface}" for i != j.
-
-    Example for 2 nodes both using en5:
-        [[null, "rdma_en5"], ["rdma_en5", null]]
-    """
-    n = len(all_nodes)
-    matrix: list[list[str | None]] = []
-    for i in range(n):
-        row: list[str | None] = []
-        for j in range(n):
-            if i == j:
-                row.append(None)
-            else:
-                row.append(f"rdma_{all_nodes[i].interface}")
-        matrix.append(row)
-
-    config = json.dumps(matrix)
-    # Use printf to avoid echo interpretation issues
-    cmd = f"printf '%s' '{config}' > /tmp/mlx_ibv_devices.json"
-    result = ssh_run(
-        node.ssh_host,
-        cmd,
-        proxy=node.proxy,
-        dry_run=dry_run,
-    )
-    if dry_run:
-        print(f"  {OK} (dry-run) IBV config: /tmp/mlx_ibv_devices.json")
-        node.ibv_written = True
-        return
-
-    if result.returncode == 0:
-        node.ibv_written = True
-        print(f"  {OK} IBV config written: /tmp/mlx_ibv_devices.json")
-    else:
-        print(
-            f"  {FAIL} Failed to write IBV config: {result.stderr.strip()}"
-        )
-
-
 def step_check_rdma(node: NodeConfig, dry_run: bool) -> None:
     """Check RDMA status via rdma_ctl."""
     result = ssh_run(
@@ -420,7 +368,6 @@ def configure_nodes(
 
         step_remove_from_bridge(node, netmask_bits, dry_run)
         step_set_static_ip(node, netmask_bits, dry_run)
-        step_write_ibv_config(node, nodes, idx - 1, dry_run)
         step_check_rdma(node, dry_run)
         step_check_ibv_devices(node, dry_run)
         print()

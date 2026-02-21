@@ -46,23 +46,32 @@ def ssh_run(host: str, cmd: str, timeout: int = 10) -> subprocess.CompletedProce
         return subprocess.CompletedProcess(ssh_cmd, -1, "", "timeout")
 
 
-def parse_hosts(args: argparse.Namespace) -> list[str]:
-    if args.hostfile:
-        try:
-            with open(args.hostfile, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            hosts = []
-            for entry in data["hosts"]:
-                if isinstance(entry, dict):
-                    hosts.append(entry["ssh"])
-                else:
-                    hosts.append(str(entry))
-        except Exception as e:
-            print(f"{red('[FAIL]')} Failed to read hostfile {args.hostfile}: {e}")
-            sys.exit(1)
-        if not hosts:
-            print(f"{red('[FAIL]')} No hosts found in hostfile: {args.hostfile}")
-            sys.exit(1)
+def read_hostfile(path: str) -> dict:
+    """Read and return the parsed hostfile JSON.
+
+    Returns a dict with at least ``hosts`` (list of host entries) and
+    optionally ``envs`` (list of ``KEY=VALUE`` strings).
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"{red('[FAIL]')} Failed to read hostfile {path}: {e}")
+        sys.exit(1)
+    if "hosts" not in data or not data["hosts"]:
+        print(f"{red('[FAIL]')} No hosts found in hostfile: {path}")
+        sys.exit(1)
+    return data
+
+
+def parse_hosts(args: argparse.Namespace, hostfile_data: dict | None = None) -> list[str]:
+    if hostfile_data is not None:
+        hosts = []
+        for entry in hostfile_data["hosts"]:
+            if isinstance(entry, dict):
+                hosts.append(entry["ssh"])
+            else:
+                hosts.append(str(entry))
         return hosts
     if args.hosts:
         return args.hosts
@@ -166,44 +175,149 @@ def run_rdma_check(hosts: list[str]) -> bool:
     return ok
 
 
-def launch_server(hosts: list[str], args: argparse.Namespace, server_args: list[str]) -> bool:
-    cmd_parts = [PYTHON, "-m", "vllm_mlx.distributed_launcher"]
-    cmd_parts += ["--backend", args.backend]
-    if args.hostfile:
-        cmd_parts += ["--hostfile", args.hostfile]
-    elif args.hosts:
-        cmd_parts += ["--hosts"] + args.hosts
-    if args.num_ranks:
-        cmd_parts += ["-n", str(args.num_ranks)]
+def launch_server(
+    hosts: list[str],
+    args: argparse.Namespace,
+    server_args: list[str],
+    hostfile_data: dict | None = None,
+) -> bool:
+    """Launch distributed server using manual per-rank orchestration.
+
+    Instead of delegating to ``mlx._distributed_utils.launch``, this
+    function starts each rank process individually via SSH with the
+    appropriate environment variables (``MLX_RANK``, coordinator
+    address, IBV devices, etc.).  Rank 0 is started first and given
+    5 seconds to initialise the JACCL coordinator before subsequent
+    ranks are launched.
+    """
+    # Expand ~ in server args before shlex.join quotes them
+    server_args = [os.path.expanduser(a) if a.startswith("~") else a for a in server_args]
+
+    # --- Determine coordinator address ---
+    # Coordinator runs on rank 0.  Use the first IP from the hostfile
+    # entry (the RDMA IP), falling back to the SSH hostname.
+    coordinator_ip = hosts[0]
+    if hostfile_data is not None:
+        entry0 = hostfile_data["hosts"][0]
+        if isinstance(entry0, dict) and entry0.get("ips"):
+            coordinator_ip = entry0["ips"][0]
+    coordinator = f"{coordinator_ip}:{JACCL_PORT}"
+
+    # --- Extract RDMA arrays from hostfile (MLX official format) ---
+    rdma_json: str | None = None
+    if hostfile_data is not None:
+        hosts_data = hostfile_data["hosts"]
+        rdma_arrays = [h.get("rdma", []) for h in hosts_data if isinstance(h, dict)]
+        if rdma_arrays and all(len(r) == len(hosts_data) for r in rdma_arrays):
+            rdma_json = json.dumps(rdma_arrays)
+
+    # --- Collect environment variables ---
+    envs: dict[str, str] = {
+        "MLX_METAL_FAST_SYNCH": "1",
+        "PYTHONUNBUFFERED": "1",
+        "MLX_JACCL_COORDINATOR": coordinator,
+    }
+    if rdma_json is not None:
+        envs["MLX_IBV_DEVICES"] = "/tmp/mlx_ibv_devices.json"
+
+    # Merge envs from hostfile
+    if hostfile_data is not None:
+        for ev in hostfile_data.get("envs", []):
+            k, _, v = ev.partition("=")
+            if k:
+                envs[k] = v
+    # Merge envs from --env flag
     if args.env:
-        cmd_parts += ["--env"] + args.env
+        for ev in args.env:
+            k, _, v = ev.partition("=")
+            if k:
+                envs[k] = v
+
+    # --- Build the server command (no --backend / --hostfile) ---
+    # When MLX_RANK is set, distributed_launcher enters
+    # distributed_main() directly.
+    server_cmd = f"{PYTHON} -m vllm_mlx.distributed_launcher"
     if server_args:
-        cmd_parts += ["--"] + server_args
+        server_cmd += " " + shlex.join(server_args)
 
-    remote_cmd = shlex.join(cmd_parts)
+    # --- Determine host entries for iteration ---
+    if hostfile_data is not None:
+        host_entries = hostfile_data["hosts"]
+    else:
+        # --hosts mode: synthesize minimal entries
+        host_entries = [{"ssh": h} for h in hosts]
 
+    num_ranks = len(host_entries)
+
+    # --- Foreground mode: only works for single-rank (rank 0) ---
     if args.foreground:
-        print(f"{cyan('[START]')} Launching server in foreground mode...")
-        full_cmd = f"cd /Users/hw/vllm-mlx && {remote_cmd}"
+        print(f"{cyan('[START]')} Launching server in foreground mode (rank 0 only)...")
+        env_str = " ".join(f"{k}={shlex.quote(v)}" for k, v in envs.items())
+        env_str += " MLX_RANK=0"
+        full_cmd = f"cd /Users/hw/vllm-mlx && {env_str} {server_cmd}"
         print(f"    Command: {full_cmd}")
         os.execvp("ssh", ["ssh"] + SSH_OPTS + [hosts[0], full_cmd])
         return False
 
-    log_dir = shlex.quote(args.log_dir)
-    log_file = f"{log_dir}/tp_server.log"
-    print(f"{cyan('[START]')} Launching server in background mode...")
-    full_cmd = f"mkdir -p {log_dir} && cd /Users/hw/vllm-mlx && nohup {remote_cmd} > {log_file} 2>&1 &"
-    result = ssh_run(hosts[0], full_cmd, timeout=30)
-    if result.returncode != 0:
-        print(f"    {red('[FAIL]')} Failed to launch server on {hosts[0]}: {result.stderr.strip()}")
-        return False
-    print(f"    {green('[OK]')}   Server process started on {hosts[0]}")
-    print(f"    Log: {args.log_dir}/tp_server.log")
+    # --- Background mode: start each rank sequentially ---
+    print(f"{cyan('[START]')} Launching {num_ranks} ranks in background mode...")
+    print(f"    Coordinator: {coordinator}")
+    if rdma_json:
+        print(f"    RDMA matrix: {rdma_json}")
+    print()
+
+    log_dir_q = shlex.quote(args.log_dir)
+
+    for rank in range(num_ranks):
+        entry = host_entries[rank]
+        host_ssh = entry["ssh"] if isinstance(entry, dict) else str(entry)
+
+        # 1. Write IBV devices JSON on this host (if we have RDMA info)
+        if rdma_json is not None:
+            ibv_cmd = f"cat > /tmp/mlx_ibv_devices.json << 'IBVEOF'\n{rdma_json}\nIBVEOF"
+            ibv_result = ssh_run(host_ssh, ibv_cmd, timeout=10)
+            if ibv_result.returncode != 0:
+                print(
+                    f"  {red('[FAIL]')} Failed to write IBV config on {host_ssh}: "
+                    f"{ibv_result.stderr.strip()}"
+                )
+                return False
+
+        # 2. Build env string for this rank
+        env_str = " ".join(f"{k}={shlex.quote(v)}" for k, v in envs.items())
+        env_str += f" MLX_RANK={rank}"
+
+        # 3. Build nohup command
+        log_file = f"{log_dir_q}/tp_rank{rank}.log"
+        cmd = (
+            f"mkdir -p {log_dir_q} && "
+            f"cd /Users/hw/vllm-mlx && "
+            f"{env_str} /usr/bin/nohup {server_cmd} > {log_file} 2>&1 &"
+        )
+
+        print(f"  Starting rank {rank} on {host_ssh}...")
+        result = ssh_run(host_ssh, cmd, timeout=30)
+        if result.returncode != 0:
+            print(
+                f"    {red('[FAIL]')} Failed to start rank {rank}: "
+                f"{result.stderr.strip()}"
+            )
+            return False
+        print(f"    {green('[OK]')}   Rank {rank} started, log: {args.log_dir}/tp_rank{rank}.log")
+
+        # 4. Wait between ranks so rank 0 can initialise the coordinator
+        if rank < num_ranks - 1:
+            delay = 5
+            print(f"    Waiting {delay}s for coordinator init...")
+            time.sleep(delay)
+
+    print()
     return True
 
 
-def wait_for_startup(host: str, log_dir: str, timeout: int) -> bool:
+def wait_for_startup(host: str, log_dir: str, timeout: int, port: int = 8000) -> bool:
     print(f"{cyan('[WAIT]')} Waiting for server startup (timeout: {timeout}s)...")
+    log_file = f"{log_dir}/tp_rank0.log"
     start = time.time()
     last_progress = -30
     while True:
@@ -211,15 +325,24 @@ def wait_for_startup(host: str, log_dir: str, timeout: int) -> bool:
         print(f"\r    Elapsed: {elapsed}s / {timeout}s", end="")
         sys.stdout.flush()
 
-        result = ssh_run(host, f"grep -c 'Uvicorn running' {log_dir}/tp_server.log 2>/dev/null")
+        result = ssh_run(host, f"grep -c 'Uvicorn running' {log_file} 2>/dev/null")
         output = result.stdout.strip()
         if output:
             try:
                 if int(output) > 0:
-                    print(f"\n    {green('[OK]')}   Server started successfully")
+                    print(f"\n    {green('[OK]')}   Server started successfully (log)")
                     return True
             except ValueError:
                 pass
+
+        try:
+            url = f"http://{host}:{port}/v1/models"
+            with urllib.request.urlopen(url, timeout=5) as response:
+                if 200 <= response.status < 300:
+                    print(f"\n    {green('[OK]')}   Server responding on port {port}")
+                    return True
+        except Exception:
+            pass
 
         if elapsed >= timeout:
             print(f"\n    {red('[FAIL]')} Server did not start within {timeout}s")
@@ -229,7 +352,7 @@ def wait_for_startup(host: str, log_dir: str, timeout: int) -> bool:
             print(f"\n    [WAIT] Still waiting... ({elapsed}s)")
             last_progress = elapsed
 
-        time.sleep(2)
+        time.sleep(5)
 
 
 def health_check(host: str, port: int) -> bool:
@@ -291,20 +414,27 @@ def main() -> int:
     if server_args and server_args[0] == "--":
         server_args = server_args[1:]
 
-    hosts = parse_hosts(args)
+    # Read hostfile early so both parse_hosts and launch_server can use it
+    hostfile_data: dict | None = None
+    if args.hostfile:
+        hostfile_data = read_hostfile(args.hostfile)
+
+    hosts = parse_hosts(args, hostfile_data=hostfile_data)
     server_port = extract_server_port(server_args)
 
     if not args.skip_checks:
         if not run_preflight_checks(hosts, server_port, args.backend):
             return 1
-        if args.backend == "jaccl" and not run_rdma_check(hosts):
+        # Skip RDMA pre-check when using hostfile: launch_server writes
+        # the IBV config itself, so the file need not exist beforehand.
+        if args.backend == "jaccl" and hostfile_data is None and not run_rdma_check(hosts):
             return 1
 
-    if not launch_server(hosts, args, server_args):
+    if not launch_server(hosts, args, server_args, hostfile_data=hostfile_data):
         return 1
 
     if not args.foreground:
-        if not wait_for_startup(hosts[0], args.log_dir, args.timeout):
+        if not wait_for_startup(hosts[0], args.log_dir, args.timeout, port=server_port):
             return 1
         if not health_check(hosts[0], server_port):
             print(f"    {yellow('[WARN]')} Health check failed, but not treating as fatal")
