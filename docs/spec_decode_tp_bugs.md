@@ -1,10 +1,10 @@
 # Speculative Decoding + Tensor Parallel 버그 리포트
 
 > 작성일: 2026-02-15
-> 최종 업데이트: 2026-02-16
+> 최종 업데이트: 2026-02-21
 > 환경: 2x Mac Studio M4 Ultra 512GB, TB5 RDMA, Kimi K2.5 612GB MoE
 > 코드: vllm-mlx develop 브랜치
-> 상태: **버그 7 (k≥2 데드락) 활발히 조사 중 — 버그 6 (TP 출력 품질) 미해결**
+> 상태: **버그 7 (k≥2 데드락) 활발히 조사 중 — 버그 6 (TP 출력 품질) 해결됨 (JACCL wc.status 패치)**
 
 ---
 
@@ -17,7 +17,7 @@ n-gram speculative decoding을 분산 Tensor Parallel (TP=2) 환경에서 발견
 3. **Trim edge case / batch state sync** — ✅ 수정 완료 (`0428e89`, `ad2d1dc`)
 4. **Memory pressure 무한 루프** — ✅ 수정 완료 (`0428e89`)
 5. **TP 샘플링 동기화** — ✅ 수정 완료 (`d11cd16`)
-6. **TP 출력 품질 저하** — ❓ 미해결
+6. **TP 출력 품질 저하** — ✅ 해결됨 (JACCL wc.status 패치, 2026-02-21)
 7. **k≥2 spec decode 데드락** — 🔴 **활발히 조사 중** (`878fc00`에서 첫 시도 실패)
 
 ---
@@ -357,10 +357,11 @@ Rank 1: 116 MATCH, 0 MISMATCH
 
 ---
 
-## 버그 6: TP 모드 출력 품질 저하 — OPEN
+## 버그 6: TP 모드 출력 품질 저하 — ✅ RESOLVED (JACCL wc.status 패치)
 
 > 발견일: 2026-02-16
-> 상태: **미해결 — 원인 조사 중**
+> 해결일: 2026-02-21
+> 상태: **해결됨 — JACCL ring.cpp/mesh.cpp wc.status 체크 패치**
 
 ### 증상
 
@@ -369,26 +370,71 @@ Rank 1: 116 MATCH, 0 MISMATCH
 - temp=0에서도 256 토큰 수준에서 반복/비문/붕괴 발생
 - 단일 노드 테스트 불가 (Kimi K2.5 612GB → 단일 512GB Mac Studio에 적재 불가)
 
-### 진단 결과
+### 이전 진단 (모두 오진)
 
 - **Inter-rank divergence**: ❌ 아님 (0 MISMATCH 확인)
-- **MoE routing divergence**: ❌ 아님 (게이트 라우팅은 양 Rank 동일, expert는 hidden dimension으로 샤딩)
+- **MoE routing divergence**: ❌ 아님 (게이트 라우팅은 양 Rank 동일)
 - **Sampling desync**: ❌ 아님 (_synced_step으로 해결)
-- **TP 구현 정확성**: ✅ 검증됨 (ShardedToAllLinear, MLA, MoE all_sum 패턴 모두 정상)
+- **TP 구현 정확성**: ✅ 검증됨
 
-### 가능한 원인
+### 이전 가설 (모두 틀렸음)
 
-1. **bfloat16 정밀도 누적**: all_sum은 bfloat16으로 수행 → 61 레이어 × N 스텝에서 반올림 오차 누적
-2. **MLA (Multi-head Latent Attention) TP 상호작용**: 압축된 KV latent + k_pe 분할이 정밀도 민감할 수 있음
-3. **int4 양자화 + TP 조합**: Kimi K2.5는 학습 시부터 int4 기본이므로 양자화 자체는 문제 아니지만, TP 분할 + 양자화의 조합이 영향줄 수 있음
-4. **Generation 파이프라인 일반 버그**: TP 무관한 문제일 수 있으나, 단일 노드 테스트 불가로 검증 불가
+1. ~~bfloat16 정밀도 누적~~ — 원인 아님
+2. ~~MLA (Multi-head Latent Attention) TP 상호작용~~ — 원인 아님
+3. ~~int4 양자화 + TP 조합~~ — 원인 아님
+4. ~~Generation 파이프라인 일반 버그~~ — 원인 아님
 
-### 다음 조사 방향
+### 진짜 근본 원인: JACCL wc.status 미체크
 
-- [ ] float32 all_sum 실험 (정밀도 누적 검증)
-- [ ] 더 작은 TP 호환 모델로 단일 노드 vs TP 품질 비교
-- [ ] Attention score 분포 비교 (TP vs 단일)
-- [ ] DeepSeek V3 MLA의 kv_latent 분할 정밀도 분석
+MLX JACCL backend의 **9개 poll 루프** (ring.cpp: 5개, mesh.cpp: 4개)가 `ibv_poll_cq`로 completion을 가져온 후 `wc[i].status`를 **전혀 체크하지 않음**. `wc[i].wr_id`만 확인.
+
+**문제 시나리오:**
+
+1. Kimi K2.5 (306GB/rank)로 대형 모델 서빙 시 RDMA 메모리 압박 발생
+2. ~22 토큰 후 RDMA 버퍼 할당 실패 (error code -12 = ENOMEM)
+3. `ibv_poll_cq`가 실패한 completion을 반환 (`wc[i].status != IBV_WC_SUCCESS`)
+4. 그러나 코드는 status를 체크하지 않고 `wc[i].wr_id`만 보고 성공으로 처리
+5. recv 버퍼에 garbage 데이터가 그대로 남아있고, 이것이 `all_sum` 결과로 사용됨
+6. 모델 출력 corruption
+
+**왜 Moonlight에서는 문제 없었나:** Moonlight는 4.5GB/rank → RDMA 메모리 압박 없음 → completion 항상 성공 → garbage 없음. Moonlight TP=2 출력이 single-node와 100% 일치한 것이 이 가설을 뒷받침.
+
+**버그 5 (_synced_step)와의 관계:** 버그 5의 샘플링 동기화 수정은 **별도의 유효한 수정**. `dist_group` 전달은 여전히 필요. 그러나 장문 출력 corruption의 주 원인은 JACCL wc.status 미체크.
+
+### 수정
+
+9개 모든 poll 루프에 다음 체크를 추가:
+
+```cpp
+// wc.status 체크 추가
+if (wc[i].status != IBV_WC_SUCCESS) {
+    throw std::runtime_error(
+        "RDMA completion failed: " + wc_status_name(wc[i].status));
+}
+
+// ibv_poll_cq 음수 반환 체크 추가
+int ne = ibv_poll_cq(cq, batch_size, wc);
+if (ne < 0) {
+    throw std::runtime_error("ibv_poll_cq failed with errno " + std::to_string(errno));
+}
+```
+
+**추가 사항:**
+- `wc_status_name()` 헬퍼 함수 추가 (사람이 읽을 수 있는 에러 메시지)
+- 수정 파일: hwstudio1의 `/Users/hw/mlx-src/mlx/distributed/jaccl/ring.cpp`, `mesh.cpp`
+- Codex 코드 리뷰 완료 및 승인
+
+### 검증 결과 (2026-02-21, 모두 통과)
+
+| 테스트 | Prefill | Decode | 속도 | 상태 |
+|--------|---------|--------|------|------|
+| 256 tokens | 2.2s (65 tok) | 16.1s | 15.9 tok/s | ✅ 정상 |
+| 512 tokens | 2.5s (81 tok) | 32.5s | 15.8 tok/s | ✅ 정상 |
+| 8490 input + 512 output | 24.5s (346 tok/s) | 34.2s | 15.0 tok/s | ✅ 정상 |
+
+- 전체 출력 coherent, corruption 제로
+- RDMA/JACCL 에러 제로
+- `_synced_step` pre==post 값 모든 step에서 일치
 
 ---
 
@@ -469,6 +515,30 @@ INFO 레벨 진단 로깅 (`[SD-TP]`, `[SD-W]` prefix)을 배포하여 데드락
 | `scheduler.py` | 1082-1084 | fixup_cache_after_filter after trim (878fc00) |
 | `scheduler.py` | 970-992 | INFO 진단 로깅 (미배포) |
 | `distributed_launcher.py` | 400-420 | Worker INFO 진단 로깅 (미배포) |
+
+---
+
+## 추가 수정사항: MLX Build (Xcode 없는 환경)
+
+> 수정일: 2026-02-21
+> 상태: **완료 — libmlx.dylib 양쪽 노드 배포 완료**
+
+### JIT Source Generation 수정 (make_compiled_preamble.sh)
+
+**문제**: `make_compiled_preamble.sh`가 `xcrun -sdk macosx metal -x metal`을 사용하여 Metal 헤더 의존성을 해석. hwstudio1/2에는 Xcode가 없어 `xcrun metal`이 실패. 에러 메시지 "error: unable to find utility 'metal'"이 헤더명으로 파싱되어 garbage JIT 소스 생성 (예: `Contents from "error:"`, `Contents from "to"`).
+
+**결과**: JIT 컴파일된 Metal 커널 (`gather_front` 등)이 `bfloat16_t`, `complex64_t` 등의 타입 정의를 포함하지 않아 런타임 실패.
+
+**수정**: `xcrun metal` → `clang -x c++ -std=c++17` + Metal 시스템 헤더 스텁 (`/Users/hw/mlx-src/metal_stubs/` 디렉토리, 9개 빈 헤더 파일)으로 clang이 Metal `#include` 지시자를 해석할 수 있도록 함.
+
+### Xcode 없이 MLX 빌드 절차
+
+1. `kernels/CMakeLists.txt`를 비움 → Metal shader 컴파일 스킵 (`xcrun metal` 필요 없음)
+2. `MLX_METAL_JIT=OFF`으로 빌드 (JIT 대신 pre-built metallib 사용)
+3. `MLX_METAL_PATH`를 pip 패키지의 pre-built `.metallib` 파일로 지정
+4. `libmlx.dylib` 빌드 후 hwstudio1, hwstudio2 양쪽에 배포
+
+**pre-built metallib 확보**: Xcode가 설치된 macOS에서 `pip install mlx`로 설치된 패키지에서 `.metallib` 파일 추출.
 
 ---
 

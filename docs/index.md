@@ -40,6 +40,7 @@ vllm-mlx brings native Apple Silicon GPU acceleration to vLLM by integrating:
 - [MCP & Tool Calling](guides/mcp-tools.md)
 - [Continuous Batching](guides/continuous-batching.md)
 - [Distributed Inference](distributed_inference.md)
+- [RDMA Setup](guides/rdma-setup.md)
 
 ### Reference
 - [CLI Commands](reference/cli.md)

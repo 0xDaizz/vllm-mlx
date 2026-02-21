@@ -538,13 +538,20 @@ def worker_loop(
     if communicator.is_distributed:
         _orig_step = batch_generator._step
 
+        _step_count = [0]
         def _synced_step(input_tokens, prompt_cache, samplers, logits_processors, tokens):
             sampled, logprobs = _orig_step(
                 input_tokens, prompt_cache, samplers, logits_processors, tokens
             )
+            pre_sync = sampled.item() if sampled.size == 1 else sampled.tolist()
             if communicator.rank > 0:
                 sampled = mx.zeros_like(sampled)
             sampled = mx.distributed.all_sum(sampled, group=communicator.group)
+            mx.eval(sampled)
+            post_sync = sampled.item() if sampled.size == 1 else sampled.tolist()
+            _step_count[0] += 1
+            if _step_count[0] <= 50:
+                logger.debug("[_synced_step] rank=%d step=%d pre=%s post=%s", communicator.rank, _step_count[0], pre_sync, post_sync)
             return sampled, logprobs
 
         batch_generator._step = _synced_step
@@ -660,11 +667,9 @@ def worker_loop(
                         logger.info("[W-NORMAL] step, batch_size=%d", len(request_id_to_uid))
                         _responses = batch_generator.next()
 
-                        # Force async computation to complete before the
-                        # broadcast overwrites batch.y.  batch_generator.next()
-                        # calls mx.async_eval(batch.y, ...) internally; without
-                        # this explicit eval, the broadcast below may overwrite
-                        # batch.y before the async computation finishes.
+                        # Force lazy all_sum computation to complete.
+                        # batch_generator.next() triggers _synced_step which
+                        # calls all_sum lazily; mx.eval materializes the result.
                         if batch_generator.active_batch is not None:
                             mx.eval(batch_generator.active_batch.y)
                             # Fix stale cache _idx after batch.filter() inside next().
@@ -674,31 +679,6 @@ def worker_loop(
                             from vllm_mlx.spec_decode.cache_utils import fixup_cache_after_filter
                             fixup_cache_after_filter(batch_generator.active_batch.cache)
 
-                    # Receive broadcast token IDs from rank 0.
-                    # Protocol: rank 0 sends broadcast_int(count) then
-                    # broadcast_tokens(token_ids). Workers must match
-                    # this exact sequence to stay synchronized.
-                    if request_id_to_uid:
-                        # Receive expected token count (matches rank 0's broadcast_int)
-                        num_tokens = communicator.broadcast_int(0, src=0)
-
-                        if num_tokens > 0:
-                            token_array = mx.zeros((num_tokens,), dtype=mx.int32)
-                            token_array = communicator.broadcast_tensor(token_array, src=0)
-                            mx.eval(token_array)
-
-                            # Apply broadcast tokens to batch state
-                            if batch_generator.active_batch is not None:
-                                batch = batch_generator.active_batch
-                                # Use actual batch size for shape validation
-                                num_active = len(batch.uids)
-                                if token_array.shape[0] != num_active:
-                                    logger.error(
-                                        f"[Rank {rank}] Token broadcast shape mismatch: "
-                                        f"received {token_array.shape[0]}, "
-                                        f"batch has {num_active}"
-                                    )
-                                batch.y = token_array
 
             except Exception as e:
                 if shutdown_event.is_set():
@@ -759,7 +739,7 @@ def distributed_main(server_args: list[str] | None = None) -> None:
 
     # Configure logging with rank prefix
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.DEBUG,
         format=f"%(asctime)s [Rank {rank}] %(name)s %(levelname)s: %(message)s",
     )
 

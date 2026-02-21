@@ -197,18 +197,16 @@ Expected output (device names may vary):
 
 ### Run Auto-Setup
 
-Use the MLX distributed configuration tool to auto-discover RDMA devices and generate the hostfile:
+Use the `rdma_setup.py` script to configure static IPs, write IBV device config, and verify RDMA connectivity on all nodes via SSH:
 
 ```bash
-mlx.distributed_config \
-    --auto-setup \
-    --over thunderbolt \
-    --backend jaccl \
-    --hosts machine-a,machine-b \
-    --output-hostfile ~/mlx_hostfile.json
+python scripts/rdma_setup.py \
+    --node machine-a:en3:10.254.0.1 \
+    --node machine-b:en3:10.254.0.2 \
+    --netmask 30
 ```
 
-> **Note:** Replace `machine-a` and `machine-b` with the actual hostnames or IP addresses of your two Mac Studios.
+> **Note:** Replace `machine-a` and `machine-b` with the actual hostnames of your two Mac Studios, and adjust the interface name (`en3`, `en5`, etc.) to match your Thunderbolt 5 port. See the [RDMA Network Setup Tool](guides/rdma-setup.md) guide for the full CLI reference, examples, and troubleshooting.
 
 ### Hostfile Format
 
@@ -618,16 +616,23 @@ ping -c 1 192.168.0.1  # should get router response
 After rebooting either machine:
 
 1. Verify RDMA is still enabled: `rdma_ctl status`
-2. Re-run the auto-setup to regenerate device mappings:
+2. Re-run the RDMA setup script to restore static IPs and IBV config:
    ```bash
-   mlx.distributed_config \
-       --auto-setup \
-       --over thunderbolt \
-       --backend jaccl \
-       --hosts machine-a,machine-b \
-       --output-hostfile ~/mlx_hostfile.json
+   python scripts/rdma_setup.py \
+       --node machine-a:en3:10.254.0.1 \
+       --node machine-b:en3:10.254.0.2 \
+       --netmask 30
    ```
+   See the [RDMA Network Setup Tool](guides/rdma-setup.md) guide for details.
 3. If using manual launch mode, ensure `/tmp/mlx_ibv_devices.json` is recreated (it is in `/tmp` and may be cleared on reboot)
+
+### Metal JIT Errors (bfloat16_t Unknown Type)
+
+**Symptom:** Runtime error containing `use of undeclared identifier 'bfloat16_t'` or similar type errors in JIT-compiled Metal kernels (e.g., `gather_front`).
+
+**Cause:** `make_compiled_preamble.sh` uses `xcrun metal` to resolve header dependencies for JIT kernel source generation. On machines without Xcode, `xcrun metal` fails with "error: unable to find utility 'metal'". This error message gets parsed as header names, producing garbage JIT source strings that do not include type definitions for `bfloat16_t`, `complex64_t`, etc.
+
+**Fix:** Build MLX with the JIT source generation fix described in the [JACCL Patch and Custom MLX Build](#jaccl-patch-and-custom-mlx-build) section. Alternatively, install Xcode or Xcode Command Line Tools on the machine.
 
 ### Batch Desync Errors
 
@@ -648,27 +653,74 @@ After rebooting either machine:
 | **Maximum cluster size** | Practical limit of ~4 nodes due to Thunderbolt port count on Mac Studio (3 usable TB5 ports; each node needs N-1 ports for N nodes in a full mesh). |
 | **No hot-add/remove** | Nodes cannot be added or removed while the server is running. The cluster topology is fixed at startup. |
 | **Text models only** | Distributed inference currently supports text LLM models. Vision-language (mlx-vlm) and audio models are not yet supported in TP mode. |
-| **Output quality in TP mode** | TP 모드에서 256+ 출력 토큰 시 품질 저하가 관찰됩니다. 양 Rank가 동일한 토큰을 생성하지만 (샘플링 동기화 확인됨), 출력 품질 자체가 단일 노드 대비 저하될 수 있습니다. bfloat16 all_sum 정밀도 누적이 의심 원인입니다. 조사 진행 중. |
+| **Output quality in TP mode** | **RESOLVED** (2026-02-21). TP 모드 출력 품질 저하 문제가 JACCL wc.status 패치로 해결되었습니다. 근본 원인은 JACCL RDMA completion poll 루프가 `wc.status`를 체크하지 않아, RDMA 메모리 압박 시 실패한 completion의 garbage 데이터가 사용된 것이었습니다. 패치된 `libmlx.dylib` 필요. 상세: `docs/spec_decode_tp_bugs.md` (Bug 6). |
 
 ---
 
 ## Known Issues
 
-### TP Output Quality Degradation (Under Investigation)
+### TP Output Quality Degradation -- RESOLVED (2026-02-21)
 
-When running large MoE models (e.g., Kimi K2.5) in TP mode, output quality may degrade after approximately 256 output tokens. Symptoms include word repetition, incoherent text, and eventual output collapse.
+**Status:** Fixed via JACCL `wc.status` check patch.
 
-**What we've verified:**
-- Both ranks produce identical tokens at every step (0 MISMATCH across 256 steps)
-- MoE routing is identical on all ranks (experts sharded by hidden dimension, not by expert index)
-- The sampling synchronization fix (`_synced_step` monkey-patch) is working correctly
+**Root cause:** All 9 RDMA completion poll loops in MLX's JACCL backend (`ring.cpp`: 5 loops, `mesh.cpp`: 4 loops) never checked `wc[i].status` after `ibv_poll_cq`. Only `wc[i].wr_id` was checked. When RDMA operations failed (e.g., ENOMEM from memory pressure with large models like Kimi K2.5 at 306GB/rank), the recv buffer contained garbage data that was silently used as the `all_sum` result, corrupting model output.
 
-**Suspected causes:**
-- bfloat16 precision accumulation across 61 layers per step
-- MLA (Multi-head Latent Attention) sensitivity to TP weight splitting
-- Interaction between int4 quantization and TP sharding
+**Fix:** Added `wc[i].status != IBV_WC_SUCCESS` check, `wc_status_name()` helper, and `ibv_poll_cq` negative return check to all 9 poll loops. This requires a patched `libmlx.dylib` build -- see [JACCL Patch and Custom MLX Build](#jaccl-patch-and-custom-mlx-build) below.
 
-This issue is being actively investigated. For updates, see `docs/spec_decode_tp_bugs.md` (Bug 6).
+**Previous hypotheses (all incorrect):** bfloat16 precision accumulation, MLA sensitivity to TP weight splitting, int4 quantization + TP interaction. The actual cause was purely at the RDMA transport layer.
+
+**Verified results after patch:**
+- 256 tokens: 15.9 tok/s, coherent output
+- 512 tokens: 15.8 tok/s, coherent output
+- 8490 input + 512 output: 15.0 tok/s, coherent output
+- Zero RDMA/JACCL errors across all tests
+
+For the full investigation history, see `docs/spec_decode_tp_bugs.md` (Bug 6).
+
+---
+
+## JACCL Patch and Custom MLX Build
+
+### JACCL wc.status Check Patch
+
+The upstream MLX JACCL backend (as of MLX 0.30) has a bug where all 9 RDMA completion poll loops (`ring.cpp`: 5 loops, `mesh.cpp`: 4 loops) never check `wc[i].status` after `ibv_poll_cq`. Failed completions (e.g., from RDMA memory pressure) silently corrupt data because the recv buffer contains garbage.
+
+**Patch applied:**
+- Added `wc[i].status != IBV_WC_SUCCESS` check to all 9 poll loops
+- Added `wc_status_name()` helper function for human-readable error messages
+- Added `ibv_poll_cq` negative return check
+
+**Files modified:** `mlx/distributed/jaccl/ring.cpp`, `mlx/distributed/jaccl/mesh.cpp`
+
+Without this patch, large models (e.g., Kimi K2.5 at 306GB/rank) will experience silent data corruption after ~22 tokens when RDMA buffer allocation fails under memory pressure.
+
+### Building MLX Without Xcode (Headless Mac Studios)
+
+Mac Studios used as compute nodes typically do not have Xcode installed. MLX's build system requires `xcrun metal` for two things:
+
+1. **Compiling Metal shader libraries** (`.metallib`)
+2. **Resolving Metal header dependencies** for JIT kernel source generation (`make_compiled_preamble.sh`)
+
+Without Xcode, `xcrun metal` fails with "error: unable to find utility 'metal'". This error message gets parsed as header names by the build scripts, producing garbage JIT source strings that lack type definitions for `bfloat16_t`, `complex64_t`, etc.
+
+**Build procedure without Xcode:**
+
+1. **Skip Metal shader compilation:** Empty `mlx/mlx/backend/metal/kernels/CMakeLists.txt`
+2. **Fix JIT source generation:** In `make_compiled_preamble.sh`, change `xcrun metal` to `clang -x c++ -std=c++17`. Create a `metal_stubs/` directory with empty stub headers for the 9 Metal system headers that MLX includes.
+3. **Build with flags:**
+   ```bash
+   cmake -B build \
+       -DMLX_METAL_JIT=OFF \
+       -DMLX_METAL_PATH=<path-to-pip-metallib>/mlx.metallib \
+       ...
+   make -C build -j$(nproc)
+   ```
+4. **Deploy:** Copy `libmlx.dylib` to both nodes, ensuring it is on the Python library load path.
+
+The pre-built `.metallib` can be obtained from an existing pip installation of MLX on a machine that has Xcode:
+```bash
+python3 -c "import mlx; import os; print(os.path.join(os.path.dirname(mlx.__file__), 'lib', 'mlx.metallib'))"
+```
 
 ---
 

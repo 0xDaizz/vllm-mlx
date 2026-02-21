@@ -1717,13 +1717,20 @@ class Scheduler:
             _orig_step = bg._step
             _comm = self._communicator
 
+            _step_count = [0]
             def _synced_step(input_tokens, prompt_cache, samplers, logits_processors, tokens):
                 sampled, logprobs = _orig_step(
                     input_tokens, prompt_cache, samplers, logits_processors, tokens
                 )
+                pre_sync = sampled.item() if sampled.size == 1 else sampled.tolist()
                 if _comm.rank > 0:
                     sampled = mx.zeros_like(sampled)
                 sampled = mx.distributed.all_sum(sampled, group=_comm.group)
+                mx.eval(sampled)
+                post_sync = sampled.item() if sampled.size == 1 else sampled.tolist()
+                _step_count[0] += 1
+                if _step_count[0] <= 50:
+                    logger.debug("[_synced_step] rank=%d step=%d pre=%s post=%s", _comm.rank, _step_count[0], pre_sync, post_sync)
                 return sampled, logprobs
 
             bg._step = _synced_step
@@ -2979,7 +2986,8 @@ class Scheduler:
                     else:
                         responses = self.batch_generator.next()
                         output.has_work = True
-                        self._broadcast_sampled_tokens(responses)
+                        # In TP mode, _synced_step already synchronized tokens via all_sum
+                        # during next(). _broadcast_sampled_tokens is only needed in non-TP mode.
                         if responses:
                             # Invalidate stale MTP hidden states after normal decode
                             if self._mtp_hidden_states and self.config.speculative_method == "mtp":
