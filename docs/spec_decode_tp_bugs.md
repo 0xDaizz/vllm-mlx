@@ -1,10 +1,10 @@
 # Speculative Decoding + Tensor Parallel 버그 리포트
 
 > 작성일: 2026-02-15
-> 최종 업데이트: 2026-02-21
+> 최종 업데이트: 2026-02-22
 > 환경: 2x Mac Studio M4 Ultra 512GB, TB5 RDMA, Kimi K2.5 612GB MoE
 > 코드: vllm-mlx develop 브랜치
-> 상태: **버그 8 (TP=2 동시요청 hang) 활발히 조사 중 — 버그 6 (TP 출력 품질) 해결됨 (JACCL wc.status 패치)**
+> 상태: **버그 7-9 모두 해결됨 (2026-02-22) — TP=2 conc 1-8 정상 동작 확인**
 
 ---
 
@@ -18,8 +18,9 @@ n-gram speculative decoding을 분산 Tensor Parallel (TP=2) 환경에서 발견
 4. **Memory pressure 무한 루프** — ✅ 수정 완료 (`0428e89`)
 5. **TP 샘플링 동기화** — ✅ 수정 완료 (`d11cd16`)
 6. **TP 출력 품질 저하** — ✅ 해결됨 (JACCL wc.status 패치, 2026-02-21)
-7. **k≥2 spec decode 데드락** — 🔴 **활발히 조사 중** (`878fc00`에서 첫 시도 실패)
-8. **TP=2 동시 요청 batch hang** — 🔴 **활발히 조사 중** — 상세: [`tp_batch_hang_bug8.md`](tp_batch_hang_bug8.md)
+7. **k≥2 spec decode 데드락** — ✅ 해결됨 (Bug 9 수정으로 함께 해결, `26e7a72`)
+8. **TP=2 동시 요청 batch hang** — ✅ 해결됨 (Bug 9, `26e7a72`) — 상세: [`tp_batch_hang_bug8.md`](tp_batch_hang_bug8.md)
+9. **TP batch concurrency ≥3 deadlock** — ✅ 해결됨 (`26e7a72`, 2026-02-22)
 
 ---
 
@@ -556,3 +557,28 @@ INFO 레벨 진단 로깅 (`[SD-TP]`, `[SD-W]` prefix)을 배포하여 데드락
 
 ### JACCL EBUSY
 - kill 후 30초 대기 필수 (RDMA 자원 해제 대기)
+
+---
+
+## 버그 9: TP Batch Concurrency ≥3 Deadlock — ✅ FIXED
+
+**커밋**: `26e7a72`
+**날짜**: 2026-02-22
+
+**문제**: TP=2에서 동시 요청 3개 이상 시 서버 deadlock. 근본 원인은 stop_tokens 불일치로 인한 비대칭 batch.filter() → all_sum shape 불일치.
+
+**수정 (3건)**:
+1. **Worker stop_tokens 통일**: Worker의 BatchGenerator 생성 시 Rank 0의 `_get_stop_tokens()` 로직 미러링. `_actual_tokenizer` 추출 포함.
+2. **should_step 플래그**: `StepPlan.should_step` 추가하여 Worker가 Rank 0의 `next()` 호출 여부를 명시적으로 전달받음.
+3. **Fingerprint fail-fast**: 불일치 시 `raise RuntimeError`으로 silent hang 대신 즉시 종료.
+
+**검증**: TP=2 Moonlight-16B + Draft k=3, concurrency 1-8 전부 hang 없이 완료.
+
+| Conc | Prefill | Decode tok/s | Throughput |
+|:----:|:-------:|:------------:|:----------:|
+| 1 | 0.81s | 82.4 | 53.6 tok/s |
+| 2 | 0.76s | 75.4 | 88.2 tok/s |
+| 3 | 0.79s | 49.9 | 97.0 tok/s |
+| 8 | 2.47s | 28.3 | 129.8 tok/s |
+
+**수정 파일**: `distributed.py`, `distributed_launcher.py`, `scheduler.py`

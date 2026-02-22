@@ -3,7 +3,7 @@
 > 작성일: 2026-02-21
 > 환경: 2x Mac Studio M3 Ultra 512GB, TB5 RDMA (JACCL), Kimi K2.5 612GB MoE
 > 코드: vllm-mlx develop 브랜치
-> 상태: **조사 중** — stop_tokens 버그 수정 + 상세 로깅 추가, 재현 테스트 필요
+> 상태: **✅ 해결됨** — Bug 9 (`26e7a72`, 2026-02-22)로 수정. stop_tokens 통일 + should_step + fingerprint fail-fast.
 
 ---
 
@@ -215,10 +215,10 @@ bg = BatchGenerator(
 
 1. [x] stop_tokens 버그 수정
 2. [x] 상세 _synced_step 로깅 추가
-3. [ ] 코드를 양쪽 studio에 배포 (rsync)
-4. [ ] 동일 조건으로 hang 재현 → 새 로그에서 정확한 hang 지점 파악
-5. [ ] fixup_cache_after_filter 누락 수정 (Worker remove 경로)
-6. [ ] Codex 분석 결과 반영
+3. [x] 코드를 양쪽 studio에 배포 (rsync)
+4. [x] 동일 조건으로 hang 재현 → Bug 9 (`26e7a72`)로 해결
+5. [x] fixup_cache_after_filter 누락 수정 (Worker remove 경로)
+6. [x] Codex 분석 결과 반영 → should_step, __dict__.get 호환성 등 반영 완료
 
 ## 관련 파일
 
