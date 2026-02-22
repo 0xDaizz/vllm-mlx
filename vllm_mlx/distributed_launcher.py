@@ -770,28 +770,46 @@ def worker_loop(
                             else:
                                 _cache_key = None
 
-                            if _cache_key and ins_op.request_id in request_id_to_uid:
+                            _in_map = ins_op.request_id in request_id_to_uid
+                            _batch = batch_generator.active_batch
+                            _batch_uids = list(_batch.uids) if _batch is not None else []
+                            logger.info(
+                                "[TP-CACHE] worker(%d) cache store check: "
+                                "req=%s cache_key=%s in_map=%s batch=%s uids=%s",
+                                rank, ins_op.request_id[:12],
+                                len(_cache_key) if _cache_key else None,
+                                _in_map, _batch is not None, _batch_uids,
+                            )
+
+                            if _cache_key and _in_map:
                                 _uid = request_id_to_uid[ins_op.request_id]
-                                _batch = batch_generator.active_batch
                                 if _batch is not None:
+                                    _found = False
                                     for _bidx, _buid in enumerate(_batch.uids):
                                         if _buid == _uid:
+                                            _found = True
                                             try:
                                                 _extracted = _batch.extract_cache(_bidx)
                                                 _worker_cache.store(_cache_key, _extracted)
-                                                logger.debug(
+                                                logger.info(
                                                     "[TP-CACHE] worker(%d) stored cache: "
                                                     "req=%s tokens=%d",
                                                     rank, ins_op.request_id[:12],
                                                     len(_cache_key),
                                                 )
                                             except Exception as _e:
-                                                logger.debug(
-                                                    "[TP-CACHE] worker(%d) cache store failed: "
+                                                logger.info(
+                                                    "[TP-CACHE] worker(%d) cache store FAILED: "
                                                     "req=%s err=%s",
                                                     rank, ins_op.request_id[:12], _e,
                                                 )
                                             break
+                                    if not _found:
+                                        logger.info(
+                                            "[TP-CACHE] worker(%d) uid NOT FOUND in batch: "
+                                            "req=%s uid=%d batch_uids=%s",
+                                            rank, ins_op.request_id[:12], _uid, _batch_uids,
+                                        )
 
                 # Verify fingerprint for batch sync detection
                 if plan.fingerprint:
