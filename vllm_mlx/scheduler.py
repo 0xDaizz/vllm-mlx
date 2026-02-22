@@ -2829,6 +2829,7 @@ class Scheduler:
             sampling_seeds=seeds,
             fingerprint=fingerprint,
             spec_decode_plan=spec_decode_plan,
+            should_step=bool(self.batch_generator is not None and self.running),
         )
 
     def step(self, max_retries: int = 1) -> SchedulerOutput:

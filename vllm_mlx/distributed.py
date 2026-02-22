@@ -45,6 +45,7 @@ class StepPlan:
     sampling_seeds: dict[str, int]  # per-request RNG seeds
     fingerprint: str  # batch composition hash for sync verification
     spec_decode_plan: SpecDecodePlan | None = None
+    should_step: bool = True  # whether rank 0 will call next() this step
 
 
 @dataclass

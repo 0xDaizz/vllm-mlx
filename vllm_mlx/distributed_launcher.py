@@ -524,10 +524,31 @@ def worker_loop(
     # Import BatchGenerator from mlx-lm
     from mlx_lm.generate import BatchGenerator
 
+    # Build stop_tokens matching Rank 0's _get_stop_tokens() logic
+    # to prevent asymmetric batch.filter() → all_sum shape mismatch → deadlock
+    # Extract actual tokenizer from processor wrapper (mirrors scheduler._get_actual_tokenizer)
+    _actual_tokenizer = tokenizer
+    if hasattr(tokenizer, "tokenizer"):
+        _actual_tokenizer = tokenizer.tokenizer
+    stop_tokens = set()
+    for tok in [tokenizer, _actual_tokenizer]:
+        if tok is None:
+            continue
+        if hasattr(tok, "eos_token_id") and tok.eos_token_id is not None:
+            if isinstance(tok.eos_token_id, list):
+                stop_tokens.update(tok.eos_token_id)
+            else:
+                stop_tokens.add(tok.eos_token_id)
+        if hasattr(tok, "eos_token_ids") and tok.eos_token_ids is not None:
+            if isinstance(tok.eos_token_ids, (list, set, tuple)):
+                stop_tokens.update(tok.eos_token_ids)
+            else:
+                stop_tokens.add(tok.eos_token_ids)
+
     batch_generator = BatchGenerator(
         model=model,
         max_tokens=4096,
-        stop_tokens=set(tokenizer.eos_token_ids) if hasattr(tokenizer, 'eos_token_ids') else set(),
+        stop_tokens=stop_tokens,
         sampler=sampler,
     )
 
@@ -682,10 +703,13 @@ def worker_loop(
                     if local_fingerprint != plan.fingerprint:
                         logger.error(
                             f"[Rank {rank}] BATCH DESYNC DETECTED! "
-                            f"Fingerprint mismatch: local={local_fingerprint}, "
-                            f"rank0={plan.fingerprint}, "
-                            f"local_requests={len(local_running_ids)}, "
-                            f"batch_size={local_batch_size}"
+                            f"local={local_fingerprint} rank0={plan.fingerprint} "
+                            f"local_reqs={len(local_running_ids)} batch_size={local_batch_size}"
+                        )
+                        raise RuntimeError(
+                            f"[Rank {rank}] Batch desync at step {plan.step_id}. "
+                            f"local_fp={local_fingerprint} rank0_fp={plan.fingerprint} "
+                            f"Terminating to prevent deadlock."
                         )
                 # Check if this step is a speculative decoding step
                 if plan.spec_decode_plan is not None:
@@ -713,7 +737,7 @@ def worker_loop(
                     # Normal decode path
                     # Execute forward pass (model computation with all_sum).
                     # This must happen on all ranks simultaneously.
-                    if request_id_to_uid:  # Only if there are active requests
+                    if plan.__dict__.get("should_step", bool(request_id_to_uid)):  # Sync with rank 0's next() decision
                         _w_active_uids = (
                             list(batch_generator.active_batch.uids)
                             if batch_generator.active_batch else []
