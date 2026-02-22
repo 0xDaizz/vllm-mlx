@@ -2927,8 +2927,6 @@ class Scheduler:
                     # Rank 0 must participate in the same collective to avoid deadlock.
                     _any_cache_used = any(op.use_cache for op in plan.inserts)
                     if _any_cache_used:
-                        import mlx.core as mx
-
                         # Rank 0 always votes 1 for its own cache (it's the one that hit)
                         _r0_mask = mx.array(
                             [1 for _ in plan.inserts], dtype=mx.int32
