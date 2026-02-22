@@ -705,6 +705,7 @@ def worker_loop(
                         global_mask_list = cache_masks  # All 1s, no collective needed
 
                     # Phase 3: Insert with validated cache decisions
+                    _inserted_tokens_map = {}  # request_id -> tokens actually inserted
                     for i, insert_op in enumerate(plan.inserts):
                         all_agree = global_mask_list[i] == world_size
                         use_local_cache = (
@@ -744,6 +745,7 @@ def worker_loop(
                             uid = uids[0]
                             request_id_to_uid[insert_op.request_id] = uid
                             uid_to_request_id[uid] = insert_op.request_id
+                            _inserted_tokens_map[insert_op.request_id] = tokens_for_insert
                             logger.debug(
                                 "[TP-DEBUG] worker(%d) AFTER insert: "
                                 "req=%s uid=%d success=True cached=%s",
@@ -755,6 +757,41 @@ def worker_loop(
                                 "req=%s uids=None success=False",
                                 rank, insert_op.request_id[:12],
                             )
+
+                    # Store KV cache for newly inserted requests (after prefill, before next())
+                    if _worker_cache is not None:
+                        for ins_op in plan.inserts:
+                            # Determine cache key: full prompt tokens
+                            if ins_op.full_tokens:
+                                _cache_key = ins_op.full_tokens
+                            elif not ins_op.use_cache and ins_op.request_id in _inserted_tokens_map:
+                                # First occurrence: tokens_for_insert IS the full prompt
+                                _cache_key = _inserted_tokens_map[ins_op.request_id]
+                            else:
+                                _cache_key = None
+
+                            if _cache_key and ins_op.request_id in request_id_to_uid:
+                                _uid = request_id_to_uid[ins_op.request_id]
+                                _batch = batch_generator.active_batch
+                                if _batch is not None:
+                                    for _bidx, _buid in enumerate(_batch.uids):
+                                        if _buid == _uid:
+                                            try:
+                                                _extracted = _batch.extract_cache(_bidx)
+                                                _worker_cache.store(_cache_key, _extracted)
+                                                logger.debug(
+                                                    "[TP-CACHE] worker(%d) stored cache: "
+                                                    "req=%s tokens=%d",
+                                                    rank, ins_op.request_id[:12],
+                                                    len(_cache_key),
+                                                )
+                                            except Exception as _e:
+                                                logger.debug(
+                                                    "[TP-CACHE] worker(%d) cache store failed: "
+                                                    "req=%s err=%s",
+                                                    rank, ins_op.request_id[:12], _e,
+                                                )
+                                            break
 
                 # Verify fingerprint for batch sync detection
                 if plan.fingerprint:
@@ -877,32 +914,6 @@ def worker_loop(
                                     "batch %d -> %d step_id=%d",
                                     rank, _batch_size_before, _batch_size_after, plan.step_id,
                                 )
-
-                        # Store KV cache for newly inserted requests (cache save)
-                        if _worker_cache is not None and plan.inserts:
-                            for ins_op in plan.inserts:
-                                if ins_op.full_tokens and ins_op.request_id in request_id_to_uid:
-                                    _uid = request_id_to_uid[ins_op.request_id]
-                                    _batch = batch_generator.active_batch
-                                    if _batch is not None:
-                                        for _bidx, _buid in enumerate(_batch.uids):
-                                            if _buid == _uid:
-                                                try:
-                                                    _extracted = _batch.extract_cache(_bidx)
-                                                    _worker_cache.store(ins_op.full_tokens, _extracted)
-                                                    logger.debug(
-                                                        "[TP-CACHE] worker(%d) stored cache: "
-                                                        "req=%s tokens=%d",
-                                                        rank, ins_op.request_id[:12],
-                                                        len(ins_op.full_tokens),
-                                                    )
-                                                except Exception as _e:
-                                                    logger.debug(
-                                                        "[TP-CACHE] worker(%d) cache store failed: "
-                                                        "req=%s err=%s",
-                                                        rank, ins_op.request_id[:12], _e,
-                                                    )
-                                                break
 
             except Exception as e:
                 if shutdown_event.is_set():
