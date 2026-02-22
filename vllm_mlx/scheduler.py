@@ -725,33 +725,35 @@ class Scheduler:
 
         When set, the scheduler broadcasts StepPlans from rank 0
         so all ranks maintain synchronized BatchGenerator state.
+
+        Prefix caching is kept enabled in TP mode. Workers maintain
+        independent per-rank caches and use batched all_sum validation
+        to ensure all ranks agree on cache hits before using them.
         """
         self._communicator = communicator
         if communicator is not None and communicator.is_distributed:
             self._tp_world_size = communicator.world_size
             logger.info(f"Scheduler TP mode enabled: world_size={self._tp_world_size}")
 
-            # Disable prefix caching in distributed mode to prevent divergence.
-            # Workers don't receive KV cache payloads, so cache hits on rank 0
-            # would cause rank 0 to insert fewer tokens than workers expect.
-            if self.memory_aware_cache is not None:
-                logger.info(
-                    "Disabling memory-aware prefix cache for distributed mode "
-                    "(workers cannot share KV cache state)"
-                )
-                self.memory_aware_cache.clear()
-                self.memory_aware_cache = None
-            if self.prefix_cache is not None:
-                logger.info(
-                    "Disabling prefix cache for distributed mode"
-                )
-                self.prefix_cache.clear()
-                self.prefix_cache = None
+            # Block-aware (paged) cache is not yet supported in TP mode
             if self.block_aware_cache is not None:
                 logger.info(
-                    "Disabling block-aware cache for distributed mode"
+                    "Disabling block-aware cache for distributed mode "
+                    "(paged cache not yet TP-aware)"
                 )
                 self.block_aware_cache = None
+
+            # Log that memory-aware / legacy prefix cache stays enabled
+            if self.memory_aware_cache is not None:
+                logger.info(
+                    "TP prefix cache ENABLED: memory-aware cache retained for "
+                    "per-rank independent caching with all_sum validation"
+                )
+            elif self.prefix_cache is not None:
+                logger.info(
+                    "TP prefix cache ENABLED: legacy prefix cache retained for "
+                    "per-rank independent caching with all_sum validation"
+                )
 
     def _get_actual_tokenizer(self, tokenizer: Any) -> Any:
         """
@@ -2799,14 +2801,18 @@ class Scheduler:
             else:
                 tokens = req.prompt_token_ids
 
+            _has_cache = req.prompt_cache is not None
             inserts.append(InsertOp(
                 request_id=req.request_id,
                 tokens=tokens,
                 max_tokens=req.sampling_params.max_tokens,
                 cache_info={
                     "cached_tokens": req.cached_tokens or 0,
-                    "has_cache": req.prompt_cache is not None,
+                    "has_cache": _has_cache,
                 },
+                full_tokens=req.prompt_token_ids if _has_cache else None,
+                cached_tokens=req.cached_tokens or 0,
+                use_cache=_has_cache,
             ))
 
         removes = list(finished_ids) if finished_ids else []
@@ -2915,6 +2921,60 @@ class Scheduler:
                     )
                     self._communicator.broadcast_step_plan(plan)
                     self._pending_distributed_removes.clear()
+
+                    # Participate in worker cache validation all_sum.
+                    # Workers call all_sum when any insert has use_cache=True.
+                    # Rank 0 must participate in the same collective to avoid deadlock.
+                    _any_cache_used = any(op.use_cache for op in plan.inserts)
+                    if _any_cache_used:
+                        import mlx.core as mx
+
+                        # Rank 0 always votes 1 for its own cache (it's the one that hit)
+                        _r0_mask = mx.array(
+                            [1 for _ in plan.inserts], dtype=mx.int32
+                        )
+                        _global_mask = mx.distributed.all_sum(
+                            _r0_mask, group=self._communicator.group
+                        )
+                        mx.eval(_global_mask)
+                        _global_list = _global_mask.tolist()
+
+                        # Check if any worker disagreed — need to re-insert without cache
+                        for _ci, _cop in enumerate(plan.inserts):
+                            if _cop.use_cache and _global_list[_ci] < self._tp_world_size:
+                                _rid = _cop.request_id
+                                logger.info(
+                                    "[TP-CACHE] rank 0 fallback: req=%s "
+                                    "global_mask=%d (need %d)",
+                                    _rid[:12], _global_list[_ci], self._tp_world_size,
+                                )
+                                # Remove from batch_generator and re-insert with full tokens
+                                if _rid in self.request_id_to_uid:
+                                    _old_uid = self.request_id_to_uid[_rid]
+                                    self.batch_generator.remove([_old_uid])
+                                    del self.uid_to_request_id[_old_uid]
+                                    del self.request_id_to_uid[_rid]
+
+                                    _req = self.running.get(_rid)
+                                    if _req:
+                                        _req.prompt_cache = None
+                                        _req.cached_tokens = 0
+                                        _req.remaining_tokens = _req.prompt_token_ids
+                                        _new_uids = self.batch_generator.insert(
+                                            [_req.prompt_token_ids],
+                                            max_tokens=[_req.sampling_params.max_tokens],
+                                        )
+                                        if _new_uids:
+                                            _new_uid = _new_uids[0]
+                                            self.request_id_to_uid[_rid] = _new_uid
+                                            self.uid_to_request_id[_new_uid] = _rid
+                                            _req.batch_uid = _new_uid
+                                            logger.info(
+                                                "[TP-CACHE] rank 0 re-insert: "
+                                                "req=%s new_uid=%d full_tokens=%d",
+                                                _rid[:12], _new_uid,
+                                                len(_req.prompt_token_ids),
+                                            )
 
                 # Run generation step if we have running requests
                 if self.batch_generator is not None and self.running:

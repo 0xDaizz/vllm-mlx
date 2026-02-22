@@ -36,6 +36,9 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# Worker-side prefix cache (initialized in worker_loop for rank >= 1)
+_worker_cache = None
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -552,6 +555,20 @@ def worker_loop(
         sampler=sampler,
     )
 
+    # Initialize per-rank prefix cache for TP cache validation
+    from vllm_mlx.memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
+    global _worker_cache
+    worker_cache_config = MemoryCacheConfig(
+        max_memory_mb=None,  # auto-detect
+        max_memory_percent=0.20,
+        max_entries=1000,
+        tp_world_size=world_size,
+        tp_rank=rank,
+    )
+    _worker_cache = MemoryAwarePrefixCache(model, worker_cache_config)
+    logger.info(f"[Rank {rank}] Worker prefix cache initialized: "
+                f"limit={_worker_cache.memory_limit_mb:.1f}MB")
+
     # Monkey-patch _step() to add distributed sampling synchronization.
     # All ranks must use rank 0's sampled token to prevent KV cache divergence.
     if communicator.is_distributed:
@@ -645,33 +662,99 @@ def worker_loop(
                         del request_id_to_uid[request_id]
                         del uid_to_request_id[uid]
 
-                # Apply inserts
-                for insert_op in plan.inserts:
-                    logger.debug(
-                        "[TP-DEBUG] worker(%d) BEFORE insert: "
-                        "req=%s tokens=%d max_tokens=%d",
-                        rank, insert_op.request_id[:12],
-                        len(insert_op.tokens), insert_op.max_tokens,
-                    )
-                    uids = batch_generator.insert(
-                        [insert_op.tokens],
-                        max_tokens=[insert_op.max_tokens],
-                    )
-                    if uids:
-                        uid = uids[0]
-                        request_id_to_uid[insert_op.request_id] = uid
-                        uid_to_request_id[uid] = insert_op.request_id
-                        logger.debug(
-                            "[TP-DEBUG] worker(%d) AFTER insert: "
-                            "req=%s uid=%d success=True",
-                            rank, insert_op.request_id[:12], uid,
-                        )
+                # Apply inserts with per-rank cache validation
+                if plan.inserts:
+                    import mlx.core as mx
+
+                    # Phase 1: Probe local cache for each insert
+                    cache_masks = []
+                    local_caches = []    # local KV cache per insert (or None)
+                    local_remainings = []  # local remaining tokens per insert (or None)
+
+                    for insert_op in plan.inserts:
+                        if insert_op.use_cache and insert_op.full_tokens and _worker_cache is not None:
+                            local_cache, local_remaining = _worker_cache.fetch(insert_op.full_tokens)
+                            local_cached = (
+                                len(insert_op.full_tokens) - len(local_remaining)
+                                if local_cache else 0
+                            )
+                            # Strict: must match rank 0's cached count exactly
+                            cache_ok = 1 if local_cached == insert_op.cached_tokens else 0
+                            local_caches.append(local_cache)
+                            local_remainings.append(local_remaining)
+                        elif insert_op.use_cache:
+                            # use_cache=True but missing full_tokens or worker cache
+                            # → force fallback (vote 0)
+                            cache_ok = 0
+                            local_caches.append(None)
+                            local_remainings.append(None)
+                        else:
+                            cache_ok = 1  # No cache needed, always OK
+                            local_caches.append(None)
+                            local_remainings.append(None)
+                        cache_masks.append(cache_ok)
+
+                    # Phase 2: Batched all_sum validation (single collective op)
+                    any_cache_used = any(op.use_cache for op in plan.inserts)
+                    if any_cache_used:
+                        local_mask = mx.array(cache_masks, dtype=mx.int32)
+                        global_mask = mx.distributed.all_sum(local_mask, group=communicator.group)
+                        mx.eval(global_mask)
+                        global_mask_list = global_mask.tolist()
                     else:
-                        logger.debug(
-                            "[TP-DEBUG] worker(%d) AFTER insert: "
-                            "req=%s uids=None success=False",
-                            rank, insert_op.request_id[:12],
+                        global_mask_list = cache_masks  # All 1s, no collective needed
+
+                    # Phase 3: Insert with validated cache decisions
+                    for i, insert_op in enumerate(plan.inserts):
+                        all_agree = global_mask_list[i] == world_size
+                        use_local_cache = (
+                            insert_op.use_cache and all_agree and local_caches[i] is not None
                         )
+
+                        if use_local_cache:
+                            # Use rank 0's authoritative token suffix for consistency
+                            tokens_for_insert = insert_op.tokens
+                            cache_for_insert = [local_caches[i]]
+                        else:
+                            # Fallback: full tokens, no cache
+                            tokens_for_insert = insert_op.full_tokens if insert_op.full_tokens else insert_op.tokens
+                            cache_for_insert = None
+
+                            if insert_op.use_cache:
+                                logger.info(
+                                    "[TP-CACHE] worker(%d) cache FALLBACK: "
+                                    "req=%s global_mask=%d (need %d)",
+                                    rank, insert_op.request_id[:12],
+                                    global_mask_list[i], world_size,
+                                )
+
+                        logger.debug(
+                            "[TP-DEBUG] worker(%d) BEFORE insert: "
+                            "req=%s tokens=%d max_tokens=%d use_cache=%s all_agree=%s",
+                            rank, insert_op.request_id[:12],
+                            len(tokens_for_insert), insert_op.max_tokens,
+                            use_local_cache, all_agree,
+                        )
+                        uids = batch_generator.insert(
+                            [tokens_for_insert],
+                            max_tokens=[insert_op.max_tokens],
+                            caches=cache_for_insert,
+                        )
+                        if uids:
+                            uid = uids[0]
+                            request_id_to_uid[insert_op.request_id] = uid
+                            uid_to_request_id[uid] = insert_op.request_id
+                            logger.debug(
+                                "[TP-DEBUG] worker(%d) AFTER insert: "
+                                "req=%s uid=%d success=True cached=%s",
+                                rank, insert_op.request_id[:12], uid, use_local_cache,
+                            )
+                        else:
+                            logger.debug(
+                                "[TP-DEBUG] worker(%d) AFTER insert: "
+                                "req=%s uids=None success=False",
+                                rank, insert_op.request_id[:12],
+                            )
 
                 # Verify fingerprint for batch sync detection
                 if plan.fingerprint:
@@ -795,6 +878,31 @@ def worker_loop(
                                     rank, _batch_size_before, _batch_size_after, plan.step_id,
                                 )
 
+                        # Store KV cache for newly inserted requests (cache save)
+                        if _worker_cache is not None and plan.inserts:
+                            for ins_op in plan.inserts:
+                                if ins_op.full_tokens and ins_op.request_id in request_id_to_uid:
+                                    _uid = request_id_to_uid[ins_op.request_id]
+                                    _batch = batch_generator.active_batch
+                                    if _batch is not None:
+                                        for _bidx, _buid in enumerate(_batch.uids):
+                                            if _buid == _uid:
+                                                try:
+                                                    _extracted = _batch.extract_cache(_bidx)
+                                                    _worker_cache.store(ins_op.full_tokens, _extracted)
+                                                    logger.debug(
+                                                        "[TP-CACHE] worker(%d) stored cache: "
+                                                        "req=%s tokens=%d",
+                                                        rank, ins_op.request_id[:12],
+                                                        len(ins_op.full_tokens),
+                                                    )
+                                                except Exception as _e:
+                                                    logger.debug(
+                                                        "[TP-CACHE] worker(%d) cache store failed: "
+                                                        "req=%s err=%s",
+                                                        rank, ins_op.request_id[:12], _e,
+                                                    )
+                                                break
 
             except Exception as e:
                 if shutdown_event.is_set():

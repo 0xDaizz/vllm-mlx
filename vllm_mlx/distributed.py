@@ -30,9 +30,12 @@ class InsertOp:
     """A request to insert into the running batch."""
 
     request_id: str
-    tokens: list[int]
+    tokens: list[int]           # remaining tokens (after cache hit)
     max_tokens: int
     cache_info: dict | None = None
+    full_tokens: list[int] | None = None  # Full prompt tokens (cache key, sent only when use_cache=True)
+    cached_tokens: int = 0                # Number of cached tokens (rank 0 basis)
+    use_cache: bool = False               # Whether rank 0 had a cache hit
 
 
 @dataclass
