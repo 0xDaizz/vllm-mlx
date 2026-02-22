@@ -569,6 +569,39 @@ def worker_loop(
     logger.info(f"[Rank {rank}] Worker prefix cache initialized: "
                 f"limit={_worker_cache.memory_limit_mb:.1f}MB")
 
+    # uid -> full prompt tokens, populated at insert time, consumed by hook
+    _worker_cache_keys: dict[int, list[int]] = {}
+
+    # Install _process_prompts hook to store KV cache at prompt-only state.
+    # This mirrors rank 0's _install_chunked_prefill hook in scheduler.py.
+    # The hook fires INSIDE next() AFTER _process_prompts() returns and
+    # BEFORE _generation_step(), so KV cache has exactly N prompt entries
+    # and num_tokens == 0.
+    _orig_process_prompts = batch_generator._process_prompts
+
+    def _worker_cache_save_hook(prompts, _orig=_orig_process_prompts):
+        batch = _orig(prompts)
+        for e, uid_val in enumerate(batch.uids):
+            if batch.num_tokens[e] == 0 and uid_val in _worker_cache_keys:
+                try:
+                    _extracted = batch.extract_cache(e)
+                    _ck = _worker_cache_keys.pop(uid_val)
+                    _worker_cache.store(_ck, _extracted)
+                    logger.info(
+                        "[TP-CACHE] worker(%d) stored cache via hook: "
+                        "uid=%d tokens=%d",
+                        rank, uid_val, len(_ck),
+                    )
+                except Exception as _e:
+                    logger.info(
+                        "[TP-CACHE] worker(%d) cache store hook FAILED: "
+                        "uid=%d err=%s",
+                        rank, uid_val, _e,
+                    )
+        return batch
+
+    batch_generator._process_prompts = _worker_cache_save_hook
+
     # Monkey-patch _step() to add distributed sampling synchronization.
     # All ranks must use rank 0's sampled token to prevent KV cache divergence.
     if communicator.is_distributed:
@@ -746,6 +779,18 @@ def worker_loop(
                             request_id_to_uid[insert_op.request_id] = uid
                             uid_to_request_id[uid] = insert_op.request_id
                             _inserted_tokens_map[insert_op.request_id] = tokens_for_insert
+
+                            # Record cache key for _process_prompts hook
+                            if _worker_cache is not None:
+                                if insert_op.full_tokens:
+                                    _ck = insert_op.full_tokens
+                                elif not insert_op.use_cache:
+                                    _ck = tokens_for_insert
+                                else:
+                                    _ck = None
+                                if _ck:
+                                    _worker_cache_keys[uid] = _ck
+
                             logger.debug(
                                 "[TP-DEBUG] worker(%d) AFTER insert: "
                                 "req=%s uid=%d success=True cached=%s",
@@ -757,59 +802,6 @@ def worker_loop(
                                 "req=%s uids=None success=False",
                                 rank, insert_op.request_id[:12],
                             )
-
-                    # Store KV cache for newly inserted requests (after prefill, before next())
-                    if _worker_cache is not None:
-                        for ins_op in plan.inserts:
-                            # Determine cache key: full prompt tokens
-                            if ins_op.full_tokens:
-                                _cache_key = ins_op.full_tokens
-                            elif not ins_op.use_cache and ins_op.request_id in _inserted_tokens_map:
-                                # First occurrence: tokens_for_insert IS the full prompt
-                                _cache_key = _inserted_tokens_map[ins_op.request_id]
-                            else:
-                                _cache_key = None
-
-                            _in_map = ins_op.request_id in request_id_to_uid
-                            _batch = batch_generator.active_batch
-                            _batch_uids = list(_batch.uids) if _batch is not None else []
-                            logger.info(
-                                "[TP-CACHE] worker(%d) cache store check: "
-                                "req=%s cache_key=%s in_map=%s batch=%s uids=%s",
-                                rank, ins_op.request_id[:12],
-                                len(_cache_key) if _cache_key else None,
-                                _in_map, _batch is not None, _batch_uids,
-                            )
-
-                            if _cache_key and _in_map:
-                                _uid = request_id_to_uid[ins_op.request_id]
-                                if _batch is not None:
-                                    _found = False
-                                    for _bidx, _buid in enumerate(_batch.uids):
-                                        if _buid == _uid:
-                                            _found = True
-                                            try:
-                                                _extracted = _batch.extract_cache(_bidx)
-                                                _worker_cache.store(_cache_key, _extracted)
-                                                logger.info(
-                                                    "[TP-CACHE] worker(%d) stored cache: "
-                                                    "req=%s tokens=%d",
-                                                    rank, ins_op.request_id[:12],
-                                                    len(_cache_key),
-                                                )
-                                            except Exception as _e:
-                                                logger.info(
-                                                    "[TP-CACHE] worker(%d) cache store FAILED: "
-                                                    "req=%s err=%s",
-                                                    rank, ins_op.request_id[:12], _e,
-                                                )
-                                            break
-                                    if not _found:
-                                        logger.info(
-                                            "[TP-CACHE] worker(%d) uid NOT FOUND in batch: "
-                                            "req=%s uid=%d batch_uids=%s",
-                                            rank, ins_op.request_id[:12], _uid, _batch_uids,
-                                        )
 
                 # Verify fingerprint for batch sync detection
                 if plan.fingerprint:
