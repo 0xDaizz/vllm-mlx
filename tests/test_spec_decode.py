@@ -602,6 +602,13 @@ class _DummyProposer:
         # Default: return list [100, 101, ... 100+k-1]
         return list(range(100, 100 + k))
 
+    def propose_with_context(self, ctx) -> "Proposal":
+        """Delegate to propose() and wrap the result in a Proposal."""
+        from vllm_mlx.spec_decode.proposer import Proposal
+
+        tokens = self.propose(ctx.token_ids, ctx.k)
+        return Proposal(token_ids=tokens)
+
     def reset(self):
         # Only clear n-gram state, not the call log (used for test assertions)
         pass

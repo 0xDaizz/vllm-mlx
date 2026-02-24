@@ -1211,8 +1211,8 @@ class TestWorkerSpecDecodeStep:
         assert finished == set()
 
     def test_worker_spec_decode_no_active_batch(self):
-        """Test worker spec decode when no active batch exists."""
-        from vllm_mlx.distributed import SpecDecodePlan, SpecDecodeResult
+        """Test worker spec decode raises RuntimeError when no active batch exists."""
+        from vllm_mlx.distributed import SpecDecodePlan
         from vllm_mlx.distributed_launcher import _worker_spec_decode_step
 
         spec_plan = SpecDecodePlan(
@@ -1227,27 +1227,17 @@ class TestWorkerSpecDecodeStep:
 
         mock_model = MagicMock()
         mock_comm = MagicMock()
-        spec_result = SpecDecodeResult(
-            step_id=1,
-            accepted_tokens={},
-            trim_amounts=[],
-            new_y=[],
-            finished_ids=[],
-        )
-        mock_comm.receive_spec_decode_result.return_value = spec_result
+        mock_comm.rank = 1
 
-        finished = _worker_spec_decode_step(
-            spec_plan=spec_plan,
-            batch_generator=mock_bg,
-            model=mock_model,
-            communicator=mock_comm,
-            request_id_to_uid={},
-            uid_to_request_id={},
-        )
-
-        assert finished == set()
-        # Should still receive result to avoid hang
-        mock_comm.receive_spec_decode_result.assert_called_once()
+        with pytest.raises(RuntimeError, match="no active batch"):
+            _worker_spec_decode_step(
+                spec_plan=spec_plan,
+                batch_generator=mock_bg,
+                model=mock_model,
+                communicator=mock_comm,
+                request_id_to_uid={},
+                uid_to_request_id={},
+            )
 
     def test_worker_spec_decode_with_finished(self):
         """Test worker spec decode handles finished requests."""

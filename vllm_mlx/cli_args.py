@@ -497,6 +497,10 @@ def build_scheduler_config(args):
         ),
         model_name=getattr(args, "model", None),
         mtp_model_name=getattr(args, "mtp_model", None),
+        # Qwen3-Next built-in MTP (upstream compat)
+        enable_mtp=getattr(args, "enable_mtp", False),
+        mtp_num_draft_tokens=getattr(args, "mtp_num_draft_tokens", 1),
+        mtp_optimistic=getattr(args, "mtp_optimistic", False),
     )
 
 
