@@ -208,7 +208,7 @@ def serve_command(args):
         scheduler_config=scheduler_config,
         stream_interval=args.stream_interval if args.continuous_batching else 1,
         max_tokens=args.max_tokens,
-        force_mllm=getattr(args, "mllm", False),
+        force_mllm=args.mllm,
     )
 
     # Start server

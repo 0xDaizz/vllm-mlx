@@ -327,6 +327,35 @@ def add_speculative_decoding_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_mtp_args(parser: argparse.ArgumentParser) -> None:
+    """Add upstream-compatible MTP (Multi-Token Prediction) arguments.
+
+    These flags provide compatibility with upstream's Qwen3-Next built-in MTP.
+    ``--enable-mtp`` acts as a convenience alias that sets
+    ``speculative_method="mtp"`` when no method is explicitly chosen.
+    """
+    group = parser.add_argument_group("MTP (Qwen3-Next built-in)")
+    group.add_argument(
+        "--enable-mtp",
+        action="store_true",
+        default=False,
+        help="Enable built-in MTP for models with native MTP heads (e.g. Qwen3-Next). "
+        "Convenience alias: sets --speculative-method mtp if unset.",
+    )
+    group.add_argument(
+        "--mtp-num-draft-tokens",
+        type=int,
+        default=1,
+        help="Number of draft tokens per MTP step for built-in MTP (default: 1)",
+    )
+    group.add_argument(
+        "--mtp-optimistic",
+        action="store_true",
+        default=False,
+        help="Skip MTP acceptance check for maximum speed (~5-10%% wrong tokens).",
+    )
+
+
 def add_extra_server_args(parser: argparse.ArgumentParser) -> None:
     """Add miscellaneous server-only arguments."""
     parser.add_argument(
@@ -402,6 +431,7 @@ def add_all_serve_args(
     add_tool_calling_args(parser)
     add_reasoning_args(parser)
     add_speculative_decoding_args(parser)
+    add_mtp_args(parser)
     add_extra_server_args(parser)
 
 
@@ -489,6 +519,16 @@ def validate_serve_args(args) -> None:
             "--tool-call-parser has no effect without --enable-auto-tool-choice"
         )
 
+    # --enable-mtp compatibility: auto-set speculative_method if unset
+    if getattr(args, "enable_mtp", False):
+        if args.speculative_method is None:
+            args.speculative_method = "mtp"
+        elif args.speculative_method != "mtp":
+            sys.exit(
+                "Error: --enable-mtp conflicts with --speculative-method "
+                f"{args.speculative_method}. Use --speculative-method mtp instead."
+            )
+
     # Speculative decoding requires continuous batching
     if getattr(args, "speculative_method", None) and not getattr(
         args, "continuous_batching", False
@@ -566,6 +606,8 @@ def rebuild_server_args_from_namespace(args) -> list[str]:
         "use_paged_cache": "--use-paged-cache",
         "enable_auto_tool_choice": "--enable-auto-tool-choice",
         "enable_thinking": "--enable-thinking",
+        "enable_mtp": "--enable-mtp",
+        "mtp_optimistic": "--mtp-optimistic",
     }
     for attr, flag in _BOOL_FLAGS.items():
         if getattr(args, attr, False):
@@ -595,6 +637,7 @@ def rebuild_server_args_from_namespace(args) -> list[str]:
         ("num_speculative_tokens", "--num-speculative-tokens", 3),
         ("spec_decode_auto_disable_threshold", "--spec-decode-auto-disable-threshold", 0.4),
         ("spec_decode_auto_disable_window", "--spec-decode-auto-disable-window", 50),
+        ("mtp_num_draft_tokens", "--mtp-num-draft-tokens", 1),
     ]
     for attr, flag, default in _VALUED_ARGS:
         val = getattr(args, attr, default)

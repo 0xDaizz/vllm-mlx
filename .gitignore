@@ -102,3 +102,4 @@ scripts/*
 !scripts/rdma_setup.py
 !scripts/tp_start.py
 !scripts/tp_stop.py
+!scripts/add_mtp_weights.py
