@@ -147,7 +147,12 @@ def apply_ep_adapter(
         Number of MoE layers replaced.
     """
     replaced = 0
+    # Try model.model.layers (standard) or model.language_model.model.layers (multimodal)
     layers = getattr(getattr(model, "model", None), "layers", None)
+    if layers is None:
+        lm = getattr(model, "language_model", None)
+        if lm is not None:
+            layers = getattr(getattr(lm, "model", None), "layers", None)
     if layers is None:
         logger.warning("Model has no model.layers — cannot apply EP adapter")
         return 0

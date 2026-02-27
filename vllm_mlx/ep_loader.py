@@ -165,16 +165,31 @@ def _get_num_experts(model: Any) -> int | None:
             if val is not None:
                 return val
 
+    # Check model.language_model.args (multimodal models like Qwen3.5)
+    lm = getattr(model, "language_model", None)
+    if lm is not None:
+        lm_args = getattr(lm, "args", None)
+        if lm_args is not None:
+            for attr in ("num_experts", "num_local_experts", "n_routed_experts"):
+                val = getattr(lm_args, attr, None)
+                if val is not None:
+                    return val
+
     # Try to infer from first MoE layer's switch_mlp
-    if hasattr(model, "model") and hasattr(model.model, "layers"):
-        for layer in model.model.layers:
-            mlp = getattr(layer, "mlp", None)
-            if mlp is not None:
-                switch_mlp = getattr(mlp, "switch_mlp", None)
-                if switch_mlp is not None:
-                    ne = getattr(switch_mlp, "num_experts", None)
-                    if ne is not None:
-                        return ne
+    # Check both model.model.layers and model.language_model.model.layers
+    for model_root in [model, getattr(model, "language_model", None)]:
+        if model_root is None:
+            continue
+        inner = getattr(model_root, "model", None)
+        if inner is not None and hasattr(inner, "layers"):
+            for layer in inner.layers:
+                mlp = getattr(layer, "mlp", None)
+                if mlp is not None:
+                    switch_mlp = getattr(mlp, "switch_mlp", None)
+                    if switch_mlp is not None:
+                        ne = getattr(switch_mlp, "num_experts", None)
+                        if ne is not None:
+                            return ne
 
     return None
 
