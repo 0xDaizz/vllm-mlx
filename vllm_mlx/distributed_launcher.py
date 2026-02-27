@@ -944,6 +944,226 @@ def worker_loop(
         logger.info(f"[Rank {rank}] Worker loop exited")
 
 
+def _ep_warmup(
+    model: Any,
+    ep_group: Any,
+    num_experts: int,
+    capacity_factor: float,
+    rank: int,
+) -> None:
+    """Warm up EP communication and Metal kernels.
+
+    Args:
+        model: The loaded model.
+        ep_group: The distributed group for EP.
+        num_experts: Total number of experts.
+        capacity_factor: EP capacity factor.
+        rank: This process's rank.
+    """
+    import mlx.core as mx
+
+    # Get hidden_size from model config
+    hidden_size = None
+    for attr_name in ("hidden_size", "d_model", "model_dim"):
+        config = getattr(model, "config", None) or getattr(model, "args", None)
+        if config is not None:
+            hidden_size = getattr(config, attr_name, None)
+            if hidden_size is not None:
+                break
+
+    if hidden_size is None:
+        logger.warning("[Rank %d] Cannot determine hidden_size, skipping EP warmup", rank)
+        return
+
+    # Warmup: dummy all_sum to test communication
+    r = mx.distributed.all_sum(mx.zeros((1,), dtype=mx.float32), group=ep_group)
+    mx.eval(r)
+
+    # EP-specific warmup if available
+    if hasattr(mx.distributed, "moe_ep_warmup"):
+        top_k = 10  # Conservative estimate
+        warmup_capacity = max(
+            1, int(256 * top_k * capacity_factor / num_experts)
+        )
+        mx.distributed.moe_ep_warmup(
+            group=ep_group,
+            num_experts=num_experts,
+            capacity=warmup_capacity,
+            hidden_dim=hidden_size,
+            dtype=mx.bfloat16,
+        )
+
+    logger.info("[Rank %d] EP warmup complete: E=%d", rank, num_experts)
+
+
+def worker_loop_ep(
+    communicator: Any,
+    model_name: str,
+    model: Any = None,
+    tokenizer: Any = None,
+) -> None:
+    """Worker loop for EP mode (rank >= 1).
+
+    Similar to ``worker_loop()`` but without attention-level all_sum
+    synchronization. The EPMoEAdapter handles all MoE-internal
+    communication via dispatch/combine exchanges.
+
+    StepPlan broadcast and sampling synchronization are preserved.
+
+    Args:
+        communicator: An ``MLXCommunicator`` instance.
+        model_name: HuggingFace model name or local path.
+        model: Pre-loaded model (from ep_load).
+        tokenizer: Pre-loaded tokenizer.
+    """
+    import threading
+
+    import mlx.core as mx
+
+    rank = communicator.rank
+    world_size = communicator.world_size
+
+    logger.info(f"[Rank {rank}] EP worker starting (world_size={world_size})")
+
+    if model is None or tokenizer is None:
+        raise RuntimeError(
+            f"[Rank {rank}] EP worker requires pre-loaded model and tokenizer"
+        )
+
+    # Create BatchGenerator
+    from mlx_lm.generate import BatchGenerator
+    from mlx_lm.sample_utils import make_sampler
+
+    sampler = make_sampler(temp=0.0)
+
+    # Build stop_tokens (mirrors rank 0 logic)
+    _actual_tokenizer = tokenizer
+    if hasattr(tokenizer, "tokenizer"):
+        _actual_tokenizer = tokenizer.tokenizer
+    stop_tokens = set()
+    for tok in [tokenizer, _actual_tokenizer]:
+        if tok is None:
+            continue
+        if hasattr(tok, "eos_token_id") and tok.eos_token_id is not None:
+            if isinstance(tok.eos_token_id, list):
+                stop_tokens.update(tok.eos_token_id)
+            else:
+                stop_tokens.add(tok.eos_token_id)
+        if hasattr(tok, "eos_token_ids") and tok.eos_token_ids is not None:
+            if isinstance(tok.eos_token_ids, (list, set, tuple)):
+                stop_tokens.update(tok.eos_token_ids)
+            else:
+                stop_tokens.add(tok.eos_token_ids)
+
+    batch_generator = BatchGenerator(
+        model=model,
+        max_tokens=4096,
+        stop_tokens=stop_tokens,
+        sampler=sampler,
+    )
+
+    # Monkey-patch _step() for sampling synchronization.
+    # EP mode: no attention all_sum, but sampling must be synchronized.
+    _orig_step = batch_generator._step
+
+    def _synced_step(input_tokens, prompt_cache, samplers, logits_processors, tokens):
+        sampled, logprobs = _orig_step(
+            input_tokens, prompt_cache, samplers, logits_processors, tokens
+        )
+        # EP: model forward includes MoE dispatch/combine internally.
+        # No external all_sum needed for attention.
+        mx.eval(sampled)
+        # Sync sampling: broadcast rank 0's token to all ranks.
+        if communicator.rank > 0:
+            sampled = mx.zeros_like(sampled)
+        sampled = mx.distributed.all_sum(sampled, group=communicator.group)
+        mx.eval(sampled)
+        return sampled, logprobs
+
+    batch_generator._step = _synced_step
+
+    # Track request_id -> uid mapping
+    request_id_to_uid: dict[str, int] = {}
+    uid_to_request_id: dict[int, str] = {}
+
+    logger.info(f"[Rank {rank}] EP BatchGenerator created, entering StepPlan loop")
+
+    # Ready barrier
+    communicator.barrier()
+    logger.info(f"[Rank {rank}] EP ready barrier passed")
+
+    # Shutdown handling
+    shutdown_event = threading.Event()
+
+    def _shutdown_handler(signum: int, _frame: Any) -> None:
+        logger.info(f"[Rank {rank}] Received signal {signum}, shutting down")
+        shutdown_event.set()
+
+    original_sigterm = signal.getsignal(signal.SIGTERM)
+    original_sigint = signal.getsignal(signal.SIGINT)
+    signal.signal(signal.SIGTERM, _shutdown_handler)
+    signal.signal(signal.SIGINT, _shutdown_handler)
+
+    try:
+        # StepPlan processing loop (simplified for EP — no spec decode)
+        while not shutdown_event.is_set():
+            try:
+                plan = communicator.receive_step_plan()
+
+                if plan is None:
+                    logger.info(f"[Rank {rank}] Received None plan, shutting down")
+                    break
+
+                logger.debug(
+                    "[EP-DEBUG] worker(%d) step_plan: step_id=%d "
+                    "inserts=%d removes=%d",
+                    rank, plan.step_id,
+                    len(plan.inserts), len(plan.removes),
+                )
+
+                # Apply removes
+                for request_id in plan.removes:
+                    if request_id in request_id_to_uid:
+                        uid = request_id_to_uid[request_id]
+                        batch_generator.remove([uid])
+                        del request_id_to_uid[request_id]
+                        del uid_to_request_id[uid]
+
+                # Apply inserts (no cache validation in EP — each rank
+                # has independent attention, so cache is always local)
+                for insert_op in plan.inserts:
+                    tokens = insert_op.full_tokens if insert_op.full_tokens else insert_op.tokens
+                    uids = batch_generator.insert(
+                        [tokens],
+                        max_tokens=[insert_op.max_tokens],
+                    )
+                    if uids:
+                        uid = uids[0]
+                        request_id_to_uid[insert_op.request_id] = uid
+                        uid_to_request_id[uid] = insert_op.request_id
+
+                # Execute forward pass if there are active requests
+                should_step = plan.__dict__.get(
+                    "should_step", bool(request_id_to_uid)
+                )
+                if should_step:
+                    batch_generator.next()
+
+            except Exception as e:
+                if shutdown_event.is_set():
+                    break
+                logger.error(
+                    f"[Rank {rank}] Fatal error in EP StepPlan loop: {e}",
+                    exc_info=True,
+                )
+                break
+
+    finally:
+        signal.signal(signal.SIGTERM, original_sigterm)
+        signal.signal(signal.SIGINT, original_sigint)
+        logger.info(f"[Rank {rank}] EP worker loop exited")
+
+
 # ---------------------------------------------------------------------------
 # Distributed server entry point
 # ---------------------------------------------------------------------------
@@ -1016,8 +1236,11 @@ def distributed_main(server_args: list[str] | None = None) -> None:
     os.environ["VLLM_MLX_WORLD_SIZE"] = str(world_size)
     os.environ["VLLM_MLX_BACKEND"] = backend
 
-    # --- Shared model loading (ALL ranks, collective operation) ---
-    # Extract model name from server_args or environment
+    # --- Detect EP mode from environment ---
+    global _preloaded_model
+    ep_mode = os.environ.get("VLLM_MLX_EXPERT_PARALLEL") == "1"
+
+    # --- Extract model name ---
     model_name = os.environ.get("VLLM_MLX_MODEL", "")
     if not model_name and server_args:
         for i, arg in enumerate(server_args):
@@ -1032,34 +1255,81 @@ def distributed_main(server_args: list[str] | None = None) -> None:
     # Set env for other components
     os.environ["VLLM_MLX_MODEL"] = model_name
 
-    # ALL ranks: load model with sharded_load (collective operation).
-    # This MUST be called on all ranks simultaneously because it uses
-    # all_sum internally for weight distribution.
-    logger.info(f"[Rank {rank}] Loading sharded model: {model_name}")
-    from mlx_lm.utils import sharded_load
+    if ep_mode:
+        # ------ Expert Parallelism path ------
+        from .check_mlx_ep import check_ep_api
 
-    model, tokenizer = sharded_load(
-        model_name,
-        pipeline_group=None,
-        tensor_group=communicator.group,
-    )
-    logger.info(f"[Rank {rank}] Sharded model loaded successfully")
+        check_ep_api()
 
-    # ALL ranks: synchronize after model loading
-    communicator.barrier()
-    logger.info(f"[Rank {rank}] Post-load barrier passed")
+        from .ep_adapter import apply_ep_adapter
+        from .ep_loader import ep_load
 
-    if rank == 0:
-        # Store pre-loaded model globally for server's BatchedEngine to pick up.
-        # Must store on BOTH __main__ (this process) and the package module
-        # (which batched.py imports from) since python -m loads as __main__.
-        global _preloaded_model
-        _preloaded_model = (model, tokenizer)
-        import vllm_mlx.distributed_launcher as _launcher_mod
-        _launcher_mod._preloaded_model = (model, tokenizer)
-        _run_rank0_server(communicator, server_args)
+        logger.info(f"[Rank {rank}] EP mode: loading model with expert slicing")
+        model, tokenizer = ep_load(model_name, rank, world_size)
+
+        # Read EP parameters from environment
+        capacity_factor = float(
+            os.environ.get("VLLM_MLX_EP_CAPACITY_FACTOR", "1.25")
+        )
+        kernel_backend = os.environ.get("VLLM_MLX_EP_KERNEL_BACKEND", "auto")
+
+        # Determine num_experts from model
+        from .ep_loader import _get_num_experts
+
+        num_experts = _get_num_experts(model)
+        if num_experts is None:
+            logger.error(f"[Rank {rank}] Cannot determine num_experts")
+            return
+
+        # Apply EP adapter to all MoE layers
+        replaced = apply_ep_adapter(
+            model,
+            ep_group=group,
+            rank=rank,
+            world_size=world_size,
+            num_experts_total=num_experts,
+            capacity_factor=capacity_factor,
+            kernel_backend=kernel_backend,
+        )
+        logger.info(f"[Rank {rank}] EP adapter applied to {replaced} layers")
+
+        # EP warmup
+        _ep_warmup(model, group, num_experts, capacity_factor, rank)
+
+        # Synchronize after EP setup
+        communicator.barrier()
+        logger.info(f"[Rank {rank}] EP setup complete, post-load barrier passed")
+
+        if rank == 0:
+            _preloaded_model = (model, tokenizer)
+            import vllm_mlx.distributed_launcher as _launcher_mod
+            _launcher_mod._preloaded_model = (model, tokenizer)
+            _run_rank0_server(communicator, server_args)
+        else:
+            worker_loop_ep(communicator, model_name=model_name, model=model, tokenizer=tokenizer)
     else:
-        worker_loop(communicator, model_name=model_name, model=model, tokenizer=tokenizer)
+        # ------ Tensor Parallelism path (existing) ------
+        logger.info(f"[Rank {rank}] Loading sharded model: {model_name}")
+        from mlx_lm.utils import sharded_load
+
+        model, tokenizer = sharded_load(
+            model_name,
+            pipeline_group=None,
+            tensor_group=communicator.group,
+        )
+        logger.info(f"[Rank {rank}] Sharded model loaded successfully")
+
+        # ALL ranks: synchronize after model loading
+        communicator.barrier()
+        logger.info(f"[Rank {rank}] Post-load barrier passed")
+
+        if rank == 0:
+            _preloaded_model = (model, tokenizer)
+            import vllm_mlx.distributed_launcher as _launcher_mod
+            _launcher_mod._preloaded_model = (model, tokenizer)
+            _run_rank0_server(communicator, server_args)
+        else:
+            worker_loop(communicator, model_name=model_name, model=model, tokenizer=tokenizer)
 
 
 def _run_rank0_server(

@@ -414,6 +414,26 @@ def add_distributed_args(parser: argparse.ArgumentParser) -> None:
         help="Extra environment variables to pass to workers (KEY=VALUE ...)",
     )
 
+    # Expert Parallelism (EP) arguments
+    parser.add_argument(
+        "--expert-parallel",
+        action="store_true",
+        help="Enable Expert Parallelism mode (requires --distributed)",
+    )
+    parser.add_argument(
+        "--ep-kernel-backend",
+        type=str,
+        default="auto",
+        choices=["auto", "cpu", "metal"],
+        help="EP kernel backend (default: auto)",
+    )
+    parser.add_argument(
+        "--ep-capacity-factor",
+        type=float,
+        default=1.25,
+        help="EP capacity factor for expert token slots (default: 1.25)",
+    )
+
 
 def add_all_serve_args(
     parser: argparse.ArgumentParser, *, positional_model: bool = True
@@ -568,6 +588,13 @@ def validate_serve_args(args) -> None:
                 "--dist-num-ranks, --dist-hostfile, or --dist-hosts"
             )
 
+    # Expert Parallelism checks
+    if getattr(args, "expert_parallel", False):
+        if not getattr(args, "distributed", False):
+            sys.exit("Error: --expert-parallel requires --distributed")
+        if not getattr(args, "continuous_batching", False):
+            sys.exit("Error: --expert-parallel requires --continuous-batching")
+
     # Cache memory percent must be in (0, 1]
     cache_pct = getattr(args, "cache_memory_percent", 0.20)
     if not (0 < cache_pct <= 1):
@@ -612,6 +639,7 @@ def rebuild_server_args_from_namespace(args) -> list[str]:
         "enable_thinking": "--enable-thinking",
         "enable_mtp": "--enable-mtp",
         "mtp_optimistic": "--mtp-optimistic",
+        "expert_parallel": "--expert-parallel",
     }
     for attr, flag in _BOOL_FLAGS.items():
         if getattr(args, attr, False):
@@ -642,6 +670,8 @@ def rebuild_server_args_from_namespace(args) -> list[str]:
         ("spec_decode_auto_disable_threshold", "--spec-decode-auto-disable-threshold", 0.4),
         ("spec_decode_auto_disable_window", "--spec-decode-auto-disable-window", 50),
         ("mtp_num_draft_tokens", "--mtp-num-draft-tokens", 1),
+        ("ep_capacity_factor", "--ep-capacity-factor", 1.25),
+        ("ep_kernel_backend", "--ep-kernel-backend", "auto"),
     ]
     for attr, flag, default in _VALUED_ARGS:
         val = getattr(args, attr, default)

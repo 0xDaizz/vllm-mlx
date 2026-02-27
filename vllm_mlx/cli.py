@@ -46,8 +46,17 @@ def serve_command(args):
         envs = (
             dict(pair.split("=", 1) for pair in args.dist_env)
             if args.dist_env
-            else None
+            else {}
         )
+        # EP mode environment variables
+        if getattr(args, "expert_parallel", False):
+            envs["VLLM_MLX_EXPERT_PARALLEL"] = "1"
+            envs["VLLM_MLX_EP_KERNEL_BACKEND"] = getattr(
+                args, "ep_kernel_backend", "auto"
+            )
+            envs["VLLM_MLX_EP_CAPACITY_FACTOR"] = str(
+                getattr(args, "ep_capacity_factor", 1.25)
+            )
         launch_distributed(
             script_or_module=script,
             args=server_args or None,
@@ -55,7 +64,7 @@ def serve_command(args):
             num_ranks=args.dist_num_ranks,
             hostfile=args.dist_hostfile,
             hosts=args.dist_hosts,
-            envs=envs,
+            envs=envs or None,
         )
         return
 
